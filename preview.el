@@ -1902,7 +1902,7 @@ definition of OV, AFTER-CHANGE, BEG, END and LENGTH."
     (preview-format-kill format-cons)
     (setcdr format-cons t)))
 
-(defun preview-watch-preamble (file command format-cons)
+(defun preview-watch-preamble (file out-file command format-cons)
   "Set up a watch on master file FILE.
 FILE can be an associated buffer instead of a filename.
 COMMAND is the command that generated the format.
@@ -1910,10 +1910,13 @@ FORMAT-CONS contains the format info for the main
 format dump handler."
   (let ((buffer (if (bufferp file)
                     file
-                  (find-buffer-visiting file))) ov)
+                  (find-buffer-visiting file)))
+        ov)
     (setcdr
      format-cons
-     (cons command
+     (cl-list*
+      out-file
+      command
            (when buffer
              (with-current-buffer buffer
                (save-excursion
@@ -1934,8 +1937,8 @@ format dump handler."
   "Stop watching a format on FORMAT-CONS.
 The watch has been set up by `preview-watch-preamble'."
   (when (consp (cdr format-cons))
-    (when (cddr format-cons)
-      (delete-overlay (cddr format-cons)))
+    (when (cdddr format-cons)
+      (delete-overlay (cdddr format-cons)))
     (setcdr (cdr format-cons) nil)))
 
 (defun preview-register-change (ov)
@@ -2502,10 +2505,10 @@ The elements are (NAME . ASSOC).  NAME is the master file name
 format.  Possible values: nil means no format is available
 and none should be generated.  t means no format is available,
 it should be generated on demand.  If the value is a cons cell,
-the CAR of the cons cell is the command with which the format
-has been generated, and the CDR is some Emacs-flavor specific
-value used for maintaining a watch on possible changes of the
-preamble.")
+the CAR of the cons cell is the name of output master file, the CADR of
+the cons cell is the command with which the format has been generated,
+and the CDDR is some Emacs-flavor specific value used for maintaining a
+watch on possible changes of the preamble.")
 
 (defun preview-cleanout-tempfiles ()
   "Clean out all directories and files with non-persistent data.
@@ -3161,6 +3164,7 @@ pp")
         (preview-unwatch-preamble format-cons)
         (preview-watch-preamble (current-buffer)
                                 (cadr format-cons)
+                                (caddr format-cons)
                                 format-cons)))))
 
 ;;;###autoload
@@ -4000,10 +4004,11 @@ Those are just needed for cleanup."
   "Kill a cached format.
 FORMAT-CONS is intended to be an element of `preview-dumped-alist'.
 Tries through `preview-format-extensions'."
+  (when (consp (cdr format-cons))
   (dolist (ext preview-format-extensions)
     (condition-case nil
-        (delete-file (preview-dump-file-name (concat (car format-cons) ext)))
-      (file-error nil))))
+          (delete-file (preview-dump-file-name (concat (cadr format-cons) ext)))
+        (file-error nil)))))
 
 (defun preview-dump-file-name (file)
   "Make a file name suitable for dumping from FILE."
@@ -4105,20 +4110,21 @@ If FORMAT-CONS is non-nil, a previous format may get reused."
   (interactive)
   (setq TeX-current-process-region-p nil)
   (let* ((dump-file
-          (expand-file-name (preview-dump-file-name (TeX-master-file "ini"))))
+          (expand-file-name (preview-dump-file-name (TeX-master-output-file "ini"))))
          (master (TeX-master-file))
          (format-name (expand-file-name master))
          (preview-format-name (shell-quote-argument
-                               (preview-dump-file-name (file-name-nondirectory
-                                                        master))))
+                               (preview-dump-file-name
+                                (TeX-master-output-file nil))))
          (master-file (expand-file-name (TeX-master-file t)))
+         (master-output-file (expand-file-name (TeX-master-output-file nil)))
          (command (preview-do-replacements
                    (TeX-command-expand
                     (preview-string-expand preview-LaTeX-command))
                    preview-dump-replacements))
          (preview-auto-cache-preamble nil))
     (unless (and (consp (cdr format-cons))
-                 (string= command (cadr format-cons)))
+                 (string= command (caddr format-cons)))
       (unless format-cons
         (setq format-cons (assoc format-name preview-dumped-alist)))
       (if format-cons
@@ -4165,6 +4171,7 @@ If FORMAT-CONS is non-nil, a previous format may get reused."
                                (zerop (process-exit-status process)))
                           (preview-watch-preamble
                            master-file
+                           master-output-file
                            command
                            format-cons)
                         (preview-format-kill format-cons))
