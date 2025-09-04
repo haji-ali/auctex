@@ -512,10 +512,13 @@ be consulted recursively.")
   "dvipng -picky -noghostscript %d -o %m/prev%%03d.png"
   "Command used for converting to separate PNG images.
 
+If it is a string, it is used as the command.  Otherwise, the value is
+expected to be a function that returns the command as a string.
+
 You might specify options for converting to other image types,
 but then you'll need to adapt `preview-dvipng-image-type'."
   :group 'preview-latex
-  :type 'string)
+  :type '(choice string function))
 
 (defcustom preview-dvipng-image-type
   'png
@@ -527,6 +530,39 @@ if you customize this."
   :type '(choice (const png)
                  (const gif)
                  (symbol :tag "Other" :value png)))
+
+(defun preview-dvipng-command (&optional cmd)
+  "Return a shell command for running dvipng.
+CMD can be used to override the command line which is used as a basis."
+  (let* ((res (/ (* (car preview-resolution)
+                    (preview-hook-enquiry preview-scale))
+                 (preview-get-magnification)))
+         (resolution  (format " -D%d " res))
+         (colors (preview-dvipng-color-string preview-colors res)))
+    (with-current-buffer TeX-command-buffer
+      (concat (TeX-command-expand
+               (or cmd "dvipng -picky -noghostscript %d -o %m/prev%%03d.png"))
+              " " colors resolution))))
+
+(defun preview-dvisvgm-command (&optional cmd)
+  "Return a shell command for running dvisvgm.
+CMD can be used to override the command line which is used as a basis.
+
+You may set the variable `preview-dvipng-command' to
+`'preview-dvisvgm-command' and set `preview-dvipng-image-type' to
+`'svg' to produce svg images instead of png ones."
+  (let* ((scale (* (/ (preview-hook-enquiry preview-scale)
+                      (preview-get-magnification))
+                   (with-current-buffer TeX-command-buffer
+                     (if (bound-and-true-p text-scale-mode)
+                         (expt text-scale-mode-step text-scale-mode-amount)
+                       1.0)))))
+    (with-current-buffer TeX-command-buffer
+      (concat
+       (TeX-command-expand
+        (or cmd
+            "dvisvgm --no-fonts %d --page=- --output=\"%m/prev%%3p.svg\""))
+       (format " --scale=%g " scale)))))
 
 (defcustom preview-dvips-command
   "dvips -Pwww -i -E %d -o %m/preview.000"
@@ -3842,20 +3878,13 @@ The fourth value is the transparent border thickness."
 
 (defun preview-start-dvipng ()
   "Start a DviPNG process.."
-  (let* (;; (file preview-gs-file)
-         tempdir
-         (res (/ (* (car preview-resolution)
-                    (preview-hook-enquiry preview-scale))
-                 (preview-get-magnification)))
-         (resolution  (format " -D%d " res))
-         (colors (preview-dvipng-color-string preview-colors res))
-         (command (with-current-buffer TeX-command-buffer
-                    (prog1
-                        (concat (TeX-command-expand preview-dvipng-command)
-                                " " colors resolution)
-                      (setq tempdir TeX-active-tempdir))))
+  (let* ((command
+          (if (stringp preview-dvipng-command)
+              (preview-dvipng-command preview-dvipng-command)
+            (funcall preview-dvipng-command)))
          (name "Preview-DviPNG"))
-    (setq TeX-active-tempdir tempdir)
+    (setq TeX-active-tempdir (buffer-local-value 'TeX-active-tempdir
+                                                 TeX-command-buffer))
     (goto-char (point-max))
     (insert-before-markers "Running `" name "' with ``" command "''\n")
     (setq mode-name name)
