@@ -372,6 +372,10 @@ See also `preview-gs-command'."
   "List of overlays to convert using gs.
 Buffer-local to the appropriate TeX process buffer.")
 
+(defvar-local preview-silent-errors nil
+  "When non-nil, do not signal preview errors nor display output buffer.
+This variable should be set in the process buffer.")
+
 (defvar-local preview-gs-outstanding nil
   "Overlays currently processed.")
 
@@ -455,6 +459,74 @@ This will have no effect when `preview-image-type' is
 set to `postscript'."
   :group 'preview-latex
   :type 'boolean)
+
+;;; preview-point customizations and variables.
+(defcustom preview-point-display 'after-string
+  "Specifies where to show the preview.
+
+Can be `before-string', `after-string' to show at before or after the
+TeX code or `buframe' to show in a separate frame (the `buframe' package
+must be installed).  Can also be \\='(buframe FN-POS FRAME-PARAMETERS
+BUF-PARAMETERS) where FN-POS is a position function (default is
+`buframe-position-right-of-overlay') and FRAME-PARAMETERS is an alist of
+additional frame parameters, default is nil and BUF-PARAMETERS is an
+alist of buffer local variables and their values."
+  :type '(choice
+          (const :tag "Before string" before-string)
+          (const :tag "After string (default)" after-string)
+          (const :tag "On frame" buframe)
+          (list :tag "On frame with explicit parameters"
+                (function :tag "Position function")
+                (alist :tag "Frame parameters")
+                (alist :tag "Buffer parameters"))))
+
+(define-minor-mode preview-point-mode
+  "Show the preview at point."
+  :group 'preview
+  :global t
+  :init-value nil
+
+  (if preview-point-mode
+      (when (member #'preview-move-point post-command-hook)
+        (preview-clearout)
+        (remove-hook 'pre-command-hook #'preview-mark-point t)
+        (remove-hook 'post-command-hook #'preview-move-point t)
+        (add-hook 'post-command-hook #'preview-point-move-point nil t))
+    (when (member #'preview-point-move-point post-command-hook)
+      (preview-clearout)
+      (remove-hook 'post-command-hook #'preview-point-move-point t)
+      (add-hook 'pre-command-hook #'preview-mark-point nil t)
+      (add-hook 'post-command-hook #'preview-move-point nil t)
+      (when preview-point--current-overlay
+        (preview-toggle preview-point--current-overlay nil)))))
+
+(defcustom preview-point-auto-function nil
+  "Function to determine if a preview should be created at point.
+
+When `preview-point-auto-mode' is enabled and this variable is non-nil,
+it should be a function that is is called with no arguments at (point)
+when there is not a preview already.  If the function returns a non-nil
+value, `preview-at-point' will be called.
+
+If the function returns a cons, it should be the (BEGIN . END), which
+will be used as arguments for `preview-region'."
+  :type 'symbol)
+
+(defface preview-point-disabled-face
+  '((t (:inherit shadow)))
+  "Face used when preview is disabled."
+  :group 'preview)
+
+(defface preview-point-processing-face
+  '((t (:inherit preview-point-disabled-face)))
+  "Face used when preview is processing."
+  :group 'preview)
+
+(defvar preview-point--frame nil
+  "The last active preview popup frame.")
+
+(defvar preview-point--current-overlay nil
+  "The overlay currently shown in the preview popup frame.")
 
 (defun preview-string-expand (arg &optional separator)
   "Expand ARG as a string.
@@ -629,7 +701,8 @@ is to be used."
         (insert-before-markers
          (format "%s: %s\n"
                  context (error-message-string err)))
-        (display-buffer (current-buffer)))))
+        (unless preview-silent-errors
+          (display-buffer (current-buffer))))))
   (setq preview-error-condition err))
 
 (defun preview-reraise-error (&optional process)
@@ -638,7 +711,11 @@ Makes sure that PROCESS is removed from the \"Compilation\"
 tag in the mode line."
   (when preview-error-condition
     (unwind-protect
-        (signal (car preview-error-condition) (cdr preview-error-condition))
+        (unless (buffer-local-value 'preview-silent-errors
+                                    (or (process-buffer process)
+                                        (current-buffer)))
+          (signal (car preview-error-condition)
+                  (cdr preview-error-condition)))
       (setq preview-error-condition nil
             compilation-in-progress (delq process compilation-in-progress)))))
 
@@ -709,6 +786,8 @@ and tries to restart Ghostscript if necessary."
               (let* ((err (concat preview-gs-answer "\n"
                                   (process-name process) " " string))
                      (ov (preview-gs-behead-outstanding err)))
+                (when ov
+                  (preview-point-updated ov))
                 (when (and (null ov) preview-gs-queue)
                   (save-excursion
                     (goto-char (if (marker-buffer (process-mark process))
@@ -1430,16 +1509,16 @@ Try \\[ps-run-start] \\[ps-run-buffer] and \
          (ps-open
           (let ((string
                  (concat
-                (mapconcat #'shell-quote-argument
-                            (append (list
-                                     preview-gs-command
-                                     outfile)
-                                    preview-gs-command-line)
-                            " ")
-                 "\nGS>"
-                 preview-gs-init-string
-                 (aref (overlay-get ov 'queued) 1)
-                 err)))
+                  (mapconcat #'shell-quote-argument
+                             (append (list
+                                      preview-gs-command
+                                      outfile)
+                                     preview-gs-command-line)
+                             " ")
+                  "\nGS>"
+                  preview-gs-init-string
+                  (aref (overlay-get ov 'queued) 1)
+                  err)))
             (lambda () (interactive "@") (preview-mouse-open-error string))))
          (str
           (preview-make-clickable
@@ -1494,7 +1573,8 @@ given as ANSWER."
                                     (preview-ascent-from-bb
                                      bbox)
                                     (aref preview-colors 2))))
-            (overlay-put ov 'queued nil)))))
+            (overlay-put ov 'queued nil)
+            (preview-point-updated ov)))))
     (while (and (< (length preview-gs-outstanding)
                    preview-gs-outstanding-limit)
                 (setq ov (pop preview-gs-queue)))
@@ -1706,19 +1786,22 @@ icon is cached in the property list of the SYMBOL."
 (defun preview-ascent-from-bb (bb)
   "This calculates the image ascent from its bounding box.
 The bounding box BB needs to be a 4-component vector of
-numbers (can be float if available)."
+numbers (can be float if available).
+
+If `preview-point-mode' is non-nil, this simply returns \\='center."
   ;; baseline is at 1in from the top of letter paper (11in), so it is
   ;; at 10in from the bottom precisely, which is 720 in PostScript
   ;; coordinates.  If our bounding box has its bottom not above this
   ;; line, and its top above, we can calculate a useful ascent value.
   ;; If not, something is amiss.  We just use 100 in that case.
-
-  (let ((bottom (aref bb 1))
-        (top (aref bb 3)))
-    (if (and (<= bottom 720)
-             (> top 720))
-        (round (* 100.0 (/ (- top 720.0) (- top bottom))))
-      100)))
+  (if preview-point-mode
+      'center
+    (let ((bottom (aref bb 1))
+          (top (aref bb 3)))
+      (if (and (<= bottom 720)
+               (> top 720))
+          (round (* 100.0 (/ (- top 720.0) (- top bottom))))
+        100))))
 
 (defface preview-face '((((background dark))
                          (:background "dark slate gray"))
@@ -2090,26 +2173,28 @@ purposes."
              'active
            'inactive))
         (strings (overlay-get ov 'strings)))
-    (unless (eq (overlay-get ov 'preview-state) 'disabled)
-      (overlay-put ov 'preview-state preview-state)
-      (if (eq preview-state 'active)
-          (progn
-            (overlay-put ov 'category 'preview-overlay)
-            (if (eq (overlay-start ov) (overlay-end ov))
-                (overlay-put ov 'before-string (car strings))
-              (dolist (prop '(display keymap mouse-face help-echo))
-                (overlay-put ov prop
-                             (get-text-property 0 prop (car strings))))
-              (overlay-put ov 'before-string nil))
-            (overlay-put ov 'face nil))
-        (dolist (prop '(display keymap mouse-face help-echo))
-          (overlay-put ov prop nil))
-        (overlay-put ov 'face 'preview-face)
-        (unless (cdr strings)
-          (setcdr strings (preview-inactive-string ov)))
-        (overlay-put ov 'before-string (cdr strings)))
-      (if old-urgent
-          (apply #'preview-add-urgentization old-urgent))))
+    (if preview-point-mode
+        (preview-point-activate-maybe ov arg)
+      (unless (eq (overlay-get ov 'preview-state) 'disabled)
+        (overlay-put ov 'preview-state preview-state)
+        (if (eq preview-state 'active)
+            (progn
+              (overlay-put ov 'category 'preview-overlay)
+              (if (eq (overlay-start ov) (overlay-end ov))
+                  (overlay-put ov 'before-string (car strings))
+                (dolist (prop '(display keymap mouse-face help-echo))
+                  (overlay-put ov prop
+                               (get-text-property 0 prop (car strings))))
+                (overlay-put ov 'before-string nil))
+              (overlay-put ov 'face nil))
+          (dolist (prop '(display keymap mouse-face help-echo))
+            (overlay-put ov prop nil))
+          (overlay-put ov 'face 'preview-face)
+          (unless (cdr strings)
+            (setcdr strings (preview-inactive-string ov)))
+          (overlay-put ov 'before-string (cdr strings)))
+        (if old-urgent
+            (apply #'preview-add-urgentization old-urgent)))))
   (if event
       (preview-restore-position
        ov
@@ -2340,11 +2425,21 @@ active (`transient-mark-mode'), it is run through `preview-region'."
   (unless preview-leave-open-previews-visible
     (overlay-put ovr 'preview-image nil))
   (overlay-put ovr 'timestamp nil)
-  (setcdr (overlay-get ovr 'strings) (preview-disabled-string ovr))
-  (unless preview-leave-open-previews-visible
-    (preview-toggle ovr))
+
+  (setcdr (overlay-get ovr 'strings)
+          (unless preview-point-mode
+            ;; It will be updated later in `preview-toggle'.
+            (preview-disabled-string ovr)))
+
+  (unless preview-point-mode
+    (unless preview-leave-open-previews-visible
+      (preview-toggle ovr)
+      ;; Only delete the files if we are not using the images
+      (preview--delete-overlay-files ovr)))
   (overlay-put ovr 'preview-state 'disabled)
-  (preview--delete-overlay-files ovr))
+  (when preview-point-mode
+    ;; Toggle/update preview (maybe) after setting state
+    (preview-toggle ovr t)))
 
 (defun preview--delete-overlay-files (ovr)
   "Delete files owned by OVR."
@@ -2618,7 +2713,8 @@ Deletes the dvi file when finished."
                                     (preview-ascent-from-bb
                                      (aref queued 0))
                                     (aref preview-colors 2)))
-              (overlay-put ov 'queued nil))
+              (overlay-put ov 'queued nil)
+              (preview-point-updated ov))
           (push filename oldfiles)
           ;; Do note modify `filenames' if we are not replacing
           ;; it, to avoid orphaning files. The filenames will be
@@ -2964,6 +3060,7 @@ See description of `TeX-command-list' for details."
 
 (defvar preview-map
   (let ((map (make-sparse-keymap)))
+    (define-key map "\C-t" #'preview-point-toggle)
     (define-key map "\C-p" #'preview-at-point)
     (define-key map "\C-r" #'preview-region)
     (define-key map "\C-b" #'preview-buffer)
@@ -3210,8 +3307,10 @@ pp")
 (defun preview-mode-setup ()
   "Setup proper buffer hooks and behavior for previews."
   (setq-local desktop-save-buffer #'desktop-buffer-preview-misc-data)
-  (add-hook 'pre-command-hook #'preview-mark-point nil t)
-  (add-hook 'post-command-hook #'preview-move-point nil t)
+  (if preview-point-mode
+      (add-hook 'post-command-hook #'preview-point-move-point nil t)
+    (add-hook 'pre-command-hook #'preview-mark-point nil t)
+    (add-hook 'post-command-hook #'preview-move-point nil t))
   (when (TeX-buffer-file-name)
     (let* ((filename (expand-file-name (TeX-buffer-file-name)))
            format-cons)
@@ -3803,22 +3902,28 @@ name(\\([^)]+\\))\\)\\|\
                                           (funcall preview-find-end-function
                                                    region-beg)
                                         (point)))
-                                     (ovl (preview-place-preview
-                                           snippet
-                                           region-beg
-                                           region-end
-                                           (preview-TeX-bb box)
-                                           (cons lcounters counters)
-                                           tempdir
-                                           (cdr open-data))))
-                                (setq close-data (nconc ovl close-data))
-                                (when (and preview-protect-point
-                                           (<= region-beg point-current)
-                                           (< point-current region-end))
-                                  ;; Temporarily open the preview if it
-                                  ;; would bump the point.
-                                  (preview-toggle (car ovl))
-                                  (push (car ovl) preview-temporary-opened)))
+                                     ovl)
+                                (save-excursion
+                                  ;; Restore point to current one before
+                                  ;; placing preview
+                                  (goto-char point-current)
+                                  (setq ovl (preview-place-preview
+                                             snippet
+                                             region-beg
+                                             region-end
+                                             (preview-TeX-bb box)
+                                             (cons lcounters counters)
+                                             tempdir
+                                             (cdr open-data)))
+                                  (setq close-data (nconc ovl close-data))
+                                  (when (and preview-protect-point
+                                             (<= region-beg point-current)
+                                             (< point-current region-end)
+                                             (not preview-point-mode))
+                                    ;; Temporarily open the preview if it
+                                    ;; would bump the point.
+                                    (preview-toggle (car ovl))
+                                    (push (car ovl) preview-temporary-opened))))
                             (with-current-buffer run-buffer
                               (preview-log-error
                                (list 'error
@@ -4425,6 +4530,280 @@ If not a regular release, the date of the last change.")
                                      (buffer-size buffer)))
           (insert "\n")))
     (error nil)))
+
+
+;;; preview-point
+
+;; Buframe functions, it will be assumed that buframe is installed so
+;; that it can be required.
+(declare-function buframe-position-right-of-overlay "ext:buframe"
+                  (frame ov &optional location))
+(declare-function buframe-make-buffer "ext:buframe" (name &optional locals))
+(declare-function buframe-make "ext:buframe"
+                  (frame-or-name fn-pos buffer &optional
+                                 parent-buffer parent-frame parameters))
+(declare-function buframe-disable "ext:buframe" (frame-or-name
+                                                 &optional enable))
+
+(defun preview-point--buframe (show ov str)
+  "Show or hide a a buframe popup with STR around overlay OV."
+  (require 'buframe)
+  (if show
+      (let* ((buf (buframe-make-buffer " *preview-point-buffer*"
+                                       (car-safe
+                                        (cddr (cdr-safe
+                                               preview-point-display)))))
+             (max-image-size
+              (if (integerp max-image-size)
+                  max-image-size
+                ;; Set the size max-image-size using the current frame
+                ;; since the popup frame will be small to begin with
+                (* max-image-size (frame-width)))))
+        (with-current-buffer buf
+          (let (buffer-read-only)
+            (with-silent-modifications
+              (erase-buffer)
+              (insert (propertize str
+                                  'help-echo nil
+                                  'keymap nil
+                                  'mouse-face nil))
+              (goto-char (point-min)))))
+        (setq preview-point--frame
+              (buframe-make
+               "preview-point"
+               (lambda (frame)
+                 (when preview-point--current-overlay
+                   (funcall
+                    (or (car-safe (cdr-safe preview-point-display))
+                        #'buframe-position-right-of-overlay)
+                    frame preview-point--current-overlay)))
+               buf
+               (overlay-buffer ov)
+               (window-frame)
+               (car-safe (cdr (cdr-safe preview-point-display))))))
+    (buframe-disable preview-point--frame)))
+
+(defun preview-point-inside-overlay-p (ov &optional pt)
+  "Return PT if inside overlay OV, nil otherwise.
+If PT is nil, use point of OV's buffer."
+  (or pt
+      (setq pt (and
+                (overlay-buffer ov)
+                (with-current-buffer (overlay-buffer ov)
+                  (point)))))
+  (and
+   (eq (overlay-buffer ov) (window-buffer))
+   (>= pt (overlay-start ov))
+   (< pt (overlay-end ov))
+   pt))
+
+(defun preview-point-activate-maybe (ov &optional arg)
+  "Toggle visibility of preview overlay OV.
+If ARG is non-nil, deactivate overlay instead.
+
+If (point) is not inside OV, then a call to activate the overlay is
+ignored.  If the preview is disabled, the disabled symbol is shown when
+activated, otherwise the preview state is not changed."
+  (let* ((pt (and
+              (overlay-buffer ov)
+              (with-current-buffer (overlay-buffer ov)
+                (point))))
+         (strings (overlay-get ov 'strings))
+         (construct-p (overlay-get ov 'queued))
+         (disabled-p (eq (overlay-get ov 'preview-state) 'disabled))
+         (inside-p (preview-point-inside-overlay-p ov pt))
+         (str (car strings))
+         (show (and arg inside-p)))
+    ;; Update `strings' cdr, if needed
+    (when (or construct-p disabled-p)
+      (unless (cdr (overlay-get ov 'strings))
+        (setcdr (overlay-get ov 'strings)
+                (cond
+                 (disabled-p
+                  (if preview-leave-open-previews-visible
+                      (propertize str
+                                  'face
+                                  'preview-point-disabled-face)
+                    (preview-disabled-string ov)))
+                 (construct-p
+                  (if preview-leave-open-previews-visible
+                      (propertize str
+                                  'face
+                                  'preview-point-processing-face)
+                    (propertize "x" 'display preview-nonready-icon))))))
+      (setq str (cdr (overlay-get ov 'strings))))
+
+    (unless disabled-p
+      (overlay-put ov 'preview-state
+                   (if show
+                       'active
+                     'inactive)))
+
+    (when show
+      (overlay-put ov 'category 'preview-overlay))
+
+    (when (or show
+              (eq preview-point--current-overlay ov))
+      (setq preview-point--current-overlay (and show ov))
+      (if (or (eq preview-point-display 'buframe)
+              (eq (car-safe preview-point-display) 'buframe))
+          (preview-point--buframe show ov str)
+        (overlay-put ov preview-point-display (and show str))))))
+
+(defun preview-point-move-point ()
+  "Toggle previews as point enters or leaves overlays."
+  (preview-check-changes)
+  (let* ((pt (point))
+         (lst (overlays-at pt)))
+    ;; Hide any open overlays
+    (when-let* ((ov preview-point--current-overlay))
+      (and (overlay-buffer ov)
+           (overlay-get ov 'preview-state)
+           (not (eq (overlay-get ov 'preview-state) 'inactive))
+           (when (not (preview-point-inside-overlay-p
+                       ov pt))
+             (preview-point-activate-maybe ov nil))))
+
+    ;; Show all overlays under point
+    (dolist (ovr lst)
+      (let ((state (overlay-get ovr 'preview-state)))
+        (when ;; (eq (overlay-get ovr 'preview-state) 'inactive)
+            (and (and state (not (eq state 'active)))
+                 (not (eq ovr preview-point--current-overlay)))
+          (preview-point-activate-maybe ovr t))))))
+
+(defun preview-point-auto ()
+  "Mark current region for preview, if not already there."
+  (when (and
+         preview-point-mode
+         (not (preview-point-has-preview-p))
+         preview-point-auto-function
+         (funcall preview-point-auto-function))
+    (preview-point-force-update (point) (current-buffer) t)))
+
+(defun preview-point-updated (ov)
+  "Mark preview OV as updated.
+Has effect only if `preview-point-mode' is active."
+  (when preview-point-mode
+    (preview-point-activate-maybe ov t)))
+
+(defun preview-point-toggle ()
+  "Set `preview-point' to MODE.
+If called interactively `preview-point' is toggled and the user is asked
+for the MODE when it is switch on.
+
+This function has an effect only if `preview-point' is non-nil, which
+should be set before opening a TeX file."
+  ;; Hide current overlay if it is visible.
+  (preview-point-mode (if preview-point-mode -1 0)))
+
+(define-minor-mode preview-point-auto-mode
+  "Enable automatic refreshing and generation of previews.
+When enabled, existing previews are automatically updated when there
+text is changed.  Moreover, previews are automatically created whenever
+`preview-point-auto-function' returns a non-nil value at point."
+  :group 'preview
+  :init-value nil
+  (if preview-point-auto-mode
+      (progn
+        (add-hook 'after-change-functions #'preview-point-buf-change nil t)
+        (add-hook 'post-command-hook #'preview-point-auto nil t)
+        (preview-point-buf-change))
+    (remove-hook 'after-change-functions #'preview-point-buf-change t)
+    (remove-hook 'post-command-hook #'preview-point-auto t)))
+
+;;; preview-point -- Auto-preview
+(defcustom preview-point-auto-delay 0.1
+  "Delay in seconds for automatic preview timer."
+  :type 'number)
+(defvar preview-point-force-update--debounce-timer nil)
+
+(defun preview-point@around@write-region (orig-fun &rest args)
+  "Advice around `write-region' to suppress messages.
+ORIG-FUN is the original function.  ARGS are its arguments."
+  (let ((noninteractive t)
+        (inhibit-message t)
+        message-log-max)
+    (apply orig-fun args)))
+
+(defun preview-point-force-update (pos-region buffer &optional debounce)
+  "Update preview at POS-REGION in BUFFER.
+
+POS-REGION can be a position, or a cons (BEGIN . END) signifying the
+region for which the previous should be updated.  When DEBOUNCE is
+non-nil, the call is debounced using an idle timer. This also happens
+automatically when there is an ongoing compilation process."
+  (interactive (list (point) (current-buffer)))
+
+  (when preview-point-force-update--debounce-timer
+    (cancel-timer preview-point-force-update--debounce-timer)
+    (setq preview-point-force-update--debounce-timer nil))
+
+  (when (buffer-live-p buffer)
+    (unless debounce
+      (with-current-buffer buffer
+        (if-let* ((cur-process
+                   (or (get-buffer-process (TeX-process-buffer-name
+                                            (TeX-region-file)))
+                       (get-buffer-process (TeX-process-buffer-name
+                                            (TeX-master-file))))))
+            (progn
+              ;; Force de-bouncing
+              (when (and preview-current-region
+                         (not preview-abort-flag)
+                         ;; (< beg (cdr preview-current-region))
+                         )
+                (progn
+                  (ignore-errors (TeX-kill-job))
+                  (setq preview-abort-flag t)))
+              (with-local-quit (accept-process-output cur-process))
+              (setq debounce t))
+          (let ((TeX-suppress-compilation-message t)
+                (save-silently t))
+            (advice-add 'write-region :around
+                        #'preview-point@around@write-region)
+            (unwind-protect
+                ;; If we are working in a file buffer that is not a tex file,
+                ;; then we want preview-region to operate in "non-file" mode,
+                ;; where it passes "<none>" to TeX-region-create.
+                (save-excursion
+                  ;; TODO: Check if we can rely on the `preview-region'
+                  ;; returning the process. It calls
+                  ;; `preview-generate-preview' which has this documented
+                  ;; behaviour, but not `preview-region'.
+                  (unless (consp pos-region)
+                    (goto-char pos-region)
+                    (setq pos-region
+                          (cons (preview-next-border t)
+                                (preview-next-border nil))))
+                  (let ((process (preview-region (car pos-region)
+                                                 (cdr pos-region))))
+                    (with-current-buffer (process-buffer process)
+                      (setq-local preview-silent-errors t))))
+              (advice-remove 'write-region
+                             #'preview-point@around@write-region))))))
+
+    (when debounce
+      (setq preview-point-force-update--debounce-timer
+            (run-with-idle-timer
+             preview-point-auto-delay nil
+             #'preview-point-force-update
+             pos-region buffer)))))
+
+(defun preview-point-has-preview-p (&optional pt)
+  "Return non-nil if PT has a preview overlay."
+  (cl-find-if
+   (lambda (ov) (overlay-get ov 'preview-state))
+   (overlays-at (or pt (point)))))
+
+(defun preview-point-buf-change (&rest _)
+  "Run preview at point if there is a preview overlay."
+  (when (and preview-point-mode
+             (or (preview-point-has-preview-p)
+                 preview-point-auto-function))
+    (when-let* ((region (funcall preview-point-auto-function)))
+      (preview-point-force-update
+       (if (consp region) region (point)) (current-buffer) t))))
 
 ;;;###autoload
 (defun preview-report-bug () "Report a bug in the preview-latex package."

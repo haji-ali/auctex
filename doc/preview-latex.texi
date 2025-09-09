@@ -480,6 +480,26 @@ math (@code{$@dots{}$}), or if your usage of @code{$} conflicts with
 @previewlatex{}'s, you can turn off inline math previews.  In the
 @samp{Preview Latex} group, remove @code{textmath} from
 @code{preview-default-option-list} by customizing this variable.
+
+@item Enable preview at point.
+
+To enable a mode where previews are shown only when the cursor is inside
+the preview area, set @code{preview-point}. Valid values are:
+
+@table @code
+@item after-string
+Show the preview after the TeX source.
+
+@item before-string
+Show the preview before the TeX source.
+
+@item buframe
+Show the preview in a separate frame next to the cursor. Requires the
+@code{buframe} package to be installed (available on ELPA).
+@end table
+
+See also @code{preview-point-auto-p} to enable automatic updating or
+generation of previews.
 @end itemize
 
 @node Known problems, For advanced users, Simple customization, top
