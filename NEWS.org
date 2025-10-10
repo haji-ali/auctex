@@ -21,10 +21,13 @@
 - Add new function ~preview-dvisvgm-command~ to generate SVG images in
   preview.
 
+- Add support for conditionally opening error overview when there are
+  errors. See ~TeX-error-overview-open-after-TeX-run~.
 ** Changed
 
 - Change the format of the value stored in ~preview-dumped-alist~.  Add
   a new optional argument to the function ~preview-watch-preamble~.
+- Slight change to LaTeX compilation message.
 
 - Respect the value of ~font-latex-fontify-sectioning~ when fontifying
   macros as =slide-title=.  This affects macros provided by
