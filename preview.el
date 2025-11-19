@@ -372,6 +372,10 @@ See also `preview-gs-command'."
   "List of overlays to convert using gs.
 Buffer-local to the appropriate TeX process buffer.")
 
+(defvar-local preview-silent-errors nil
+  "When non-nil, do not signal preview errors nor display output buffer.
+This variable should be set in the process buffer.")
+
 (defvar-local preview-gs-outstanding nil
   "Overlays currently processed.")
 
@@ -695,7 +699,8 @@ is to be used."
         (insert-before-markers
          (format "%s: %s\n"
                  context (error-message-string err)))
-        (display-buffer (current-buffer)))))
+        (unless preview-silent-errors
+          (display-buffer (current-buffer))))))
   (setq preview-error-condition err))
 
 (defun preview-reraise-error (&optional process)
@@ -704,7 +709,11 @@ Makes sure that PROCESS is removed from the \"Compilation\"
 tag in the mode line."
   (when preview-error-condition
     (unwind-protect
-        (signal (car preview-error-condition) (cdr preview-error-condition))
+        (unless (buffer-local-value 'preview-silent-errors
+                                    (or (process-buffer process)
+                                        (current-buffer)))
+          (signal (car preview-error-condition)
+                  (cdr preview-error-condition)))
       (setq preview-error-condition nil
             compilation-in-progress (delq process compilation-in-progress)))))
 
@@ -4641,6 +4650,135 @@ unless FORCE is non-nil."
         (when old-frame
           (set-frame-parameter old-frame 'auctex-preview nil)
           (buframe-disable old-frame))))))
+
+;;; preview-automatic -- Auto-preview
+
+(defcustom preview-automatic-function nil
+  "Function to determine if a preview should be created at point.
+
+When `preview-automatic-mode' is enabled and this variable is non-nil,
+it should be a function that is is called with no arguments at (point)
+when there is not a preview already.  If the function returns a non-nil
+value, `preview-at-point' will be called.
+
+If the function returns a cons, it should be the (BEGIN . END), which
+will be used as arguments for `preview-region'."
+  :type 'symbol)
+
+;;;###autoload
+(define-minor-mode preview-automatic-mode
+  "Enable automatic refreshing and generation of previews.
+When enabled, existing previews are automatically updated when their
+text is changed.  Moreover, previews are automatically created whenever
+`preview-automatic-function' returns a non-nil value at point."
+  :group 'preview
+  :init-value nil
+  (if preview-automatic-mode
+      (progn
+        (add-hook 'after-change-functions #'preview-automatic-buf-change nil t)
+        (add-hook 'post-command-hook #'preview-automatic-mark nil t)
+        (preview-automatic-buf-change))
+    (remove-hook 'after-change-functions #'preview-automatic-buf-change t)
+    (remove-hook 'post-command-hook #'preview-automatic-mark t)))
+
+(defcustom preview-automatic-delay 0.1
+  "Delay in seconds for automatic preview timer."
+  :type 'number)
+
+(defvar preview-automatic-update--debounce-timer nil)
+
+(defun preview-automatic@around@write-region (orig-fun &rest args)
+  "Advice around `write-region' to suppress messages.
+ORIG-FUN is the original function.  ARGS are its arguments."
+  (let ((noninteractive t)
+        (inhibit-message t)
+        message-log-max)
+    (apply orig-fun args)))
+
+(defun preview-automatic-update (pos-region buffer &optional debounce)
+  "Update preview at POS-REGION in BUFFER.
+
+POS-REGION can be a position, or a cons (BEGIN . END) signifying the
+region for which the previous should be updated.  When DEBOUNCE is
+non-nil, the call is debounced using an idle timer.  This also happens
+automatically when there is an ongoing compilation process."
+  (interactive (list (point) (current-buffer)))
+
+  (when preview-automatic-update--debounce-timer
+    (cancel-timer preview-automatic-update--debounce-timer)
+    (setq preview-automatic-update--debounce-timer nil))
+
+  (when (buffer-live-p buffer)
+    (unless debounce
+      (with-current-buffer buffer
+        (if-let* ((cur-process
+                   (or (get-buffer-process (TeX-process-buffer-name
+                                            (TeX-region-file)))
+                       (get-buffer-process (TeX-process-buffer-name
+                                            (TeX-master-file))))))
+            (progn
+              ;; Force de-bouncing
+              (when (and preview-current-region
+                         (not preview-abort-flag)
+                         ;; (< beg (cdr preview-current-region))
+                         )
+                (progn
+                  (ignore-errors (TeX-kill-job))
+                  (setq preview-abort-flag t)))
+              (with-local-quit (accept-process-output cur-process))
+              (setq debounce t))
+          (let ((TeX-suppress-compilation-message t)
+                (save-silently t)
+                (noninteractive t)
+                (inhibit-message t)
+                message-log-max)
+            ;; (advice-add 'write-region :around
+            ;;             #'preview-automatic@around@write-region)
+            (unwind-protect
+                ;; If we are working in a file buffer that is not a tex file,
+                ;; then we want preview-region to operate in "non-file" mode,
+                ;; where it passes "<none>" to TeX-region-create.
+                (save-excursion
+                  (unless (consp pos-region)
+                    (goto-char pos-region)
+                    (setq pos-region
+                          (cons (preview-next-border t)
+                                (preview-next-border nil))))
+                  (let ((process (preview-region (car pos-region)
+                                                 (cdr pos-region))))
+                    (with-current-buffer (process-buffer process)
+                      (setq-local preview-silent-errors t))))
+              (advice-remove 'write-region
+                             #'preview-automatic@around@write-region))))))
+
+    (when debounce
+      (setq preview-automatic-update--debounce-timer
+            (run-with-idle-timer
+             preview-automatic-delay nil
+             #'preview-automatic-update
+             pos-region buffer)))))
+
+(defun preview-has-preview-p (&optional pt)
+  "Return non-nil if PT has a preview overlay."
+  (cl-find-if
+   (lambda (ov) (overlay-get ov 'preview-state))
+   (overlays-at (or pt (point)))))
+
+(defun preview-automatic-mark ()
+  "Mark current region for preview, if not already there."
+  (when (and
+         (not (preview-has-preview-p))
+         preview-automatic-function
+         (funcall preview-automatic-function))
+    (preview-automatic-update (point) (current-buffer) t)))
+
+(defun preview-automatic-buf-change (&rest _)
+  "Run preview at point if there is a preview overlay."
+  (when (or (preview-has-preview-p)
+            preview-automatic-function)
+    (when-let* ((region (funcall preview-automatic-function)))
+      (preview-automatic-update
+       (if (consp region) region (point)) (current-buffer) t))))
 
 ;;;###autoload
 (defun preview-report-bug () "Report a bug in the preview-latex package."
