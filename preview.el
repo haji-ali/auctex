@@ -44,6 +44,16 @@
 ;;; a bit on movement of point
 ;;; 2. preview-automatic update create a timer every-time it gets called.
 ;;; 3. previewing falls back to png for some reason instead of svg
+;;; 4. svg file do not get face applied.
+
+;; (setq debug-on-message "Starting.*")
+
+;; (define-advice
+;;     preview-automatic-update
+;;     (:before (&rest args))
+;;   (message "Calling preview-automatic-update %S from %S"
+;;            args
+;;            (my/functions-in-call-stack)))
 
 (require 'auctex)
 (require 'tex)
@@ -655,7 +665,7 @@ You may set the variable `preview-dvi*-command' to
       (concat
        (TeX-command-expand
         (or cmd
-            "dvisvgm --no-fonts %d --page=- --output=\"%m/prev%%3p.svg\""))
+            "dvisvgm --no-fonts %d --exact --currentcolor --page=- --output=\"%m/prev%%3p.svg\""))
        (format " --scale=%g " scale)))))
 
 (defcustom preview-dvips-command
@@ -4751,8 +4761,6 @@ region for which the previous should be updated."
   (defun preview-automatic-update (pos-region buffer)
     (:documentation (documentation 'preview-automatic--update-1))
     (interactive (list (point) (current-buffer)))
-    (message "preview Called from %S %S" (my/functions-in-call-stack)
-             pos-region)
     (when preview-automatic--update-timer
       (cancel-timer preview-automatic--update-timer)
       (setq preview-automatic--update-timer nil))
