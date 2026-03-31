@@ -481,6 +481,9 @@ math (@code{$@dots{}$}), or if your usage of @code{$} conflicts with
 @samp{Preview Latex} group, remove @code{textmath} from
 @code{preview-default-option-list} by customizing this variable.
 
+See also @code{preview-automatic-mode} to enable automatic updating or
+generation of previews.
+
 @item Customize where previews are shown
 
 Set @code{preview-visibility-style} to control when previews appear:
