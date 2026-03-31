@@ -372,6 +372,10 @@ See also `preview-gs-command'."
   "List of overlays to convert using gs.
 Buffer-local to the appropriate TeX process buffer.")
 
+(defvar-local preview-silent-errors nil
+  "When non-nil, do not signal preview errors nor display output buffer.
+This variable should be set in the process buffer.")
+
 (defvar-local preview-gs-outstanding nil
   "Overlays currently processed.")
 
@@ -699,7 +703,8 @@ is to be used."
         (insert-before-markers
          (format "%s: %s\n"
                  context (error-message-string err)))
-        (display-buffer (current-buffer)))))
+        (unless preview-silent-errors
+          (display-buffer (current-buffer))))))
   (setq preview-error-condition err))
 
 (defun preview-reraise-error (&optional process)
@@ -708,7 +713,12 @@ Makes sure that PROCESS is removed from the \"Compilation\"
 tag in the mode line."
   (when preview-error-condition
     (unwind-protect
-        (signal (car preview-error-condition) (cdr preview-error-condition))
+        (unless (buffer-local-value 'preview-silent-errors
+                                    (or (and process
+                                             (process-buffer process))
+                                        (current-buffer)))
+          (signal (car preview-error-condition)
+                  (cdr preview-error-condition)))
       (setq preview-error-condition nil
             compilation-in-progress (delq process compilation-in-progress)))))
 
@@ -825,8 +835,10 @@ Gets the usual PROCESS and STRING parameters, see
         (setq preview-gs-answer (substring preview-gs-answer pos))
         (condition-case err
             (preview-gs-transact process answer)
-          (error (preview-log-error err "Ghostscript filter" process))))))
-  (preview-reraise-error))
+          (error (preview-log-error err "Ghostscript filter" process)))))
+    ;; Call `preview-reraise-error' from the process buffer since we do
+    ;; not pass the `process'.
+    (preview-reraise-error)))
 
 (defun preview-gs-restart ()
   "Start a new Ghostscript conversion process."
@@ -1583,14 +1595,10 @@ given as ANSWER."
         (when queued
           (let* ((bbox (aref queued 0))
                  (filenames (overlay-get ov 'filenames))
-                 (oldfile (nth 0 filenames))
-                 (newfile (nth 1 filenames)))
+                 (newfile (car (last filenames))))
             (if have-error
                 (preview-gs-flag-error ov answer)
-              (condition-case nil
-                  (preview-delete-file oldfile)
-                (file-error nil))
-              (overlay-put ov 'filenames (cdr filenames))
+              (preview--delete-overlay-files ov newfile)
               (preview-replace-active-icon
                ov
                (preview-create-icon (car newfile)
@@ -2173,11 +2181,15 @@ for definition of OV, AFTER-CHANGE, BEG, END and LENGTH."
     (preview-register-change ov)))
 
 (defun preview-handle-modification
-  (ov after-change _beg _end &optional _length)
+    (ov after-change _beg _end &optional _length)
   "Hook function for `modification-hooks' property.
 See info node `(elisp) Overlay Properties' for
 definition of OV, AFTER-CHANGE, BEG, END and LENGTH."
-  (unless after-change
+  (if after-change
+      (when (buffer-local-value 'preview-automatic-mode
+                                (overlay-buffer ov))
+        (preview-automatic-update (overlay-buffer ov)
+                                  (overlay-start ov)))
     (preview-register-change ov)))
 
 (defun preview--string (ov use-icon helpstring &optional click1)
@@ -2521,11 +2533,13 @@ active (`transient-mark-mode'), it is run through `preview-region'."
       (preview--delete-overlay-files ovr))
     (overlay-put ovr 'preview-state 'disabled)))
 
-(defun preview--delete-overlay-files (ovr)
+(defun preview--delete-overlay-files (ovr &optional except)
   "Delete files owned by OVR."
   (let ((filenames (overlay-get ovr 'filenames)))
-    (overlay-put ovr 'filenames nil)
-    (dolist (filename filenames)
+    (overlay-put ovr 'filenames (when (and except
+                                           (memq except filenames))
+                                  (list except)))
+    (dolist (filename (delq except filenames))
       (condition-case nil
           (preview-delete-file filename)
         (file-error nil)))))
@@ -4674,6 +4688,129 @@ See `preview-at-point-placement'."))))
       (when old-frame
         (set-frame-parameter old-frame 'auctex-preview nil)
         (buframe-disable old-frame)))))
+
+;;; preview-automatic -- Auto-preview
+
+(defcustom preview-automatic-function nil
+  "Function to determine if a preview should be created at point.
+
+When `preview-automatic-mode' is enabled and this variable is non-nil,
+it should be a function that is is called with no arguments at (point)
+when there is not a preview already.  If the function returns a non-nil
+value, `preview-at-point' will be called.
+
+If the function returns a cons, it should be the (BEGIN . END), which
+will be used as arguments for `preview-region'."
+  :type 'symbol
+  :group 'preview-latex
+  :package-version '(auctex . "14.2.0"))
+
+;;;###autoload
+(define-minor-mode preview-automatic-mode
+  "Enable automatic refreshing and generation of previews.
+When enabled, existing previews are automatically updated when their
+text is changed.  Moreover, previews are automatically created whenever
+`preview-automatic-function' returns a non-nil value at point."
+  :group 'preview-latex
+  :init-value nil
+  (if preview-automatic-mode
+      (progn
+        (add-hook 'after-change-functions
+                  #'preview-automatic--after-change nil t)
+        (preview-automatic-update (current-buffer) (point)))
+    (remove-hook 'after-change-functions
+                 #'preview-automatic--after-change t)))
+
+(defcustom preview-automatic-delay 0.1
+  "Delay in seconds for automatic preview timer."
+  :type 'number
+  :group 'preview-latex
+  :package-version '(auctex . "14.2.0"))
+
+(defun preview-automatic--update-1 (buffer pt)
+  "Update preview at PT in BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (if-let* ((cur-process
+                 (or (get-buffer-process (TeX-process-buffer-name
+                                          (TeX-region-file)))
+                     (get-buffer-process (TeX-process-buffer-name
+                                          (TeX-master-file))))))
+          (progn
+            (when (eq (process-get cur-process 'preview-automatic) t)
+              ;; This was an `preview-automatic' process, therefore we
+              ;; kill it and eventually restart it.
+              (ignore-errors (TeX-kill-job))
+              (setq preview-abort-flag t))
+            (process-put cur-process 'preview-automatic (list buffer pt))
+            (add-function :after (process-sentinel cur-process)
+                          #'preview-automatic--after-process
+                          '((name . preview-automatic)
+                            (depth . -99))))
+        (when-let* ((region
+                     (save-excursion
+                       (goto-char pt)
+                       (let* ((cur (cl-find-if
+                                    (lambda (ov)
+                                      (eq (overlay-get ov 'category)
+                                          'preview-overlay))
+                                    (overlays-at (point))))
+                              (region (or
+                                       (and cur
+                                            (eq
+                                             (overlay-get cur 'preview-state)
+                                             'disabled))
+                                       (and (not cur)
+                                            preview-automatic-function
+                                            (funcall
+                                             preview-automatic-function)))))
+                         (when region
+                           (if (consp region)
+                               region
+                             (cons (preview-next-border t)
+                                   (preview-next-border nil))))))))
+          (let ((TeX-suppress-compilation-message t)
+                (save-silently t)
+                (noninteractive t)
+                (inhibit-message t)
+                message-log-max)
+            (when-let* ((process (preview-region (car region)
+                                                 (cdr region))))
+              (process-put process 'preview-automatic t)
+              (with-current-buffer (process-buffer process)
+                (setq-local preview-silent-errors t
+                            preview-locating-previews-message nil)))))))))
+
+(if (require 'timeout nil t)
+    (defalias 'preview-automatic-update
+      (timeout-debounced-func 'preview-automatic--update-1
+                              'preview-automatic-delay))
+  ;; `timeout' is not available, define debounced
+  ;; `preview-automatic-update' manually.
+  (defvar preview-automatic--update-timer nil
+    "Timer used for debouncing preview-automatic-update.")
+  (defun preview-automatic-update (buffer pt)
+    (:documentation (documentation 'preview-automatic--update-1))
+    (when preview-automatic--update-timer
+      (cancel-timer preview-automatic--update-timer)
+      (setq preview-automatic--update-timer nil))
+
+    (setq preview-automatic--update-timer
+          (run-with-idle-timer
+           preview-automatic-delay nil
+           #'preview-automatic--update-1
+           buffer pt))))
+
+(defun preview-automatic--after-change (&rest _)
+  "Ensure a preview is updated after buffer change, if needed."
+  (preview-automatic-update (current-buffer) (point)))
+
+(defun preview-automatic--after-process (process _)
+  "Ensure a preview is updated after a process terminates, if needed."
+  (when-let* ((args (process-get process 'preview-automatic)))
+    (when (consp args)
+      (process-put process 'preview-automatic t)
+      (apply #'preview-automatic-update args))))
 
 ;;;###autoload
 (defun preview-report-bug () "Report a bug in the preview-latex package."
