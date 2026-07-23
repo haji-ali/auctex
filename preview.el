@@ -1413,8 +1413,10 @@ for the file extension."
                    (or ps-file
                        (format "preview.%03d" snippet))
                    tempdir))))
+  ;; cache the result of `preview--degenerate-box-p' here since it
+  ;; depends on buffer-local variables.
   (overlay-put ov 'queued
-               (vector box nil snippet))
+               (vector box nil snippet (preview--degenerate-box-p box)))
 
   (if-let* ((old-ov
              (and preview-keep-stale-images
@@ -1430,20 +1432,29 @@ for the file extension."
                      (overlays-at (overlay-start ov))))))))
       (let* ((img (overlay-get old-ov 'preview-image))
              (filename (cadr img))
-             (files-oov (overlay-get old-ov 'filenames))
-             (files-ov  (overlay-get ov  'filenames)))
+             (files-ov  (overlay-get ov  'filenames))
+             (entry (and filename
+                         (catch 'found
+                           (dolist (entry (overlay-get old-ov 'filenames))
+                             (let ((part (car entry)))
+                               (when (equal
+                                      (if (preview--filenames-refcounted-p
+                                           part)
+                                          (car part)
+                                        part)
+                                      filename)
+                                 (throw 'found entry))))
+                           nil))))
         (when img
-          (overlay-put ov 'preview-image img)
-          ;; Transfer filename ownership to new overlay.  The old one
-          ;; will be cleared out and its files deleted.
-          (when-let* ((entry (assoc filename files-oov)))
-            (overlay-put old-ov 'filenames
-                         (assq-delete-all filename files-oov))
-            ;; Add the filename to the current overlay instead
-            ;; if it's not already there
-            (unless (assoc filename files-ov)
-              (overlay-put ov 'filenames
-                           (cons entry files-ov))))))
+          ;; Use copy-tree to avoid `preview-replace-active-icon'
+          ;; being called on the old overlay mutating the image.
+          (overlay-put ov 'preview-image (copy-tree img))
+          (when (and entry (not (memq entry files-ov)))
+            ;; Bump the ref count, starting at 2 (old owner + this one).
+            (if (preview--filenames-refcounted-p (car entry))
+                (setcdr (car entry) (1+ (cdar entry)))
+              (setcar entry (cons (car entry) 2)))
+            (overlay-put ov 'filenames (cons entry files-ov)))))
     (overlay-put ov 'preview-image
                  (list (preview-icon-copy preview-nonready-icon))))
 
@@ -1583,21 +1594,19 @@ given as ANSWER."
         (when queued
           (let* ((bbox (aref queued 0))
                  (filenames (overlay-get ov 'filenames))
-                 (oldfile (nth 0 filenames))
-                 (newfile (nth 1 filenames)))
+                 (newfile (car (last filenames))))
             (if have-error
                 (preview-gs-flag-error ov answer)
-              (condition-case nil
-                  (preview-delete-file oldfile)
-                (file-error nil))
-              (overlay-put ov 'filenames (cdr filenames))
+              (preview--delete-overlay-files ov newfile)
               (preview-replace-active-icon
                ov
-               (preview-create-icon (car newfile)
-                                    preview-gs-image-type
-                                    (preview-ascent-from-bb
-                                     bbox)
-                                    (aref preview-colors 2))))
+               (if (aref queued 3) ;; Degenerate box
+                   (list (preview-icon-copy preview-error-icon))
+                 (preview-create-icon (car newfile)
+                                      preview-gs-image-type
+                                      (preview-ascent-from-bb
+                                       bbox)
+                                      (aref preview-colors 2)))))
             (overlay-put ov 'queued nil)))))
     (while (and (< (length preview-gs-outstanding)
                    preview-gs-outstanding-limit)
@@ -1823,6 +1832,19 @@ numbers (can be float if available)."
              (> top 720))
         (round (* 100.0 (/ (- top 720.0) (- top bottom))))
       100)))
+
+(defun preview--degenerate-box-p (box)
+  "Return non-nil if BOX would render at 1 device pixel or less.
+Happens for visually empty snippets (e.g. \\( \\)); installing such an
+image risks Emacs's image loader rejecting it (\"Invalid image size\")."
+  (and (vectorp box)
+       (= (length box) 4)
+       (let* ((width (- (aref box 2) (aref box 0)))
+              (height (- (aref box 3) (aref box 1)))
+              (dpi (or (car-safe preview-resolution) 72))
+              (scale (or preview-scale 1.0))
+              (px-per-pt (/ (* dpi scale) (* 72.0 (preview-get-magnification)))))
+         (or (<= (* width px-per-pt) 1) (<= (* height px-per-pt) 1)))))
 
 (defface preview-face '((((background dark))
                          (:background "dark slate gray"))
@@ -2521,11 +2543,13 @@ active (`transient-mark-mode'), it is run through `preview-region'."
       (preview--delete-overlay-files ovr))
     (overlay-put ovr 'preview-state 'disabled)))
 
-(defun preview--delete-overlay-files (ovr)
+(defun preview--delete-overlay-files (ovr &optional except)
   "Delete files owned by OVR."
   (let ((filenames (overlay-get ovr 'filenames)))
-    (overlay-put ovr 'filenames nil)
-    (dolist (filename filenames)
+    (overlay-put ovr 'filenames (when (and except
+                                           (memq except filenames))
+                                  (list except)))
+    (dolist (filename (delq except filenames))
       (condition-case nil
           (preview-delete-file filename)
         (file-error nil)))))
@@ -2534,6 +2558,7 @@ active (`transient-mark-mode'), it is run through `preview-region'."
   "Delete preview overlay OVR, taking any associated file along.
 IGNORED arguments are ignored, making this function usable as a hook in
 some cases."
+  (preview--invalidate-buframe-for ovr)
   (preview--delete-overlay-files ovr)
   (delete-overlay ovr))
 
@@ -2767,11 +2792,13 @@ Deletes the dvi file when finished."
               (overlay-put ov 'filenames (list filename))
               (preview-replace-active-icon
                ov
-               (preview-create-icon (car filename)
-                                    preview-dvi*-image-type
-                                    (preview-ascent-from-bb
-                                     (aref queued 0))
-                                    (aref preview-colors 2)))
+               (if (aref queued 3) ;; Degenerate box
+                   (list (preview-icon-copy preview-error-icon))
+                 (preview-create-icon (car filename)
+                                      preview-dvi*-image-type
+                                      (preview-ascent-from-bb
+                                       (aref queued 0))
+                                      (aref preview-colors 2))))
               (overlay-put ov 'queued nil))
           (push filename oldfiles)
           ;; Do note modify `filenames' if we are not replacing
@@ -2843,6 +2870,19 @@ gets converted into a CONS-cell with a name and a reference count."
     (setcar (nthcdr 2 tempdir) (1+ (nth 2 tempdir)))
     (cons (expand-file-name file (nth 0 tempdir))
           tempdir)))
+
+(defun preview--filenames-refcounted-p (part)
+  "Return non-nil if PART is in refcounted form.
+Refcounted form is \\=(FILENAME . N)."
+  (and (consp part) (integerp (cdr part))))
+
+(defun preview--filenames-entry-string (entry)
+  "Return the file name, or list of file names, for `filenames' ENTRY.
+Unwrapped from the refcounted \(... . N) form if present."
+  (let ((part (car entry)))
+    (if (preview--filenames-refcounted-p part)
+        (car part)
+      part)))
 
 (defun preview-attach-filename (attached file)
   "Attaches the absolute file name ATTACHED to FILE."
@@ -3624,6 +3664,39 @@ displayed."
 
 (defvar preview-locating-previews-message "locating previews...")
 
+(defun preview--fallback-bounds (pos)
+  "Return (BEG . END) of an existing preview overlay at or near POS, or nil.
+Used by `preview-parse-messages' as a placement anchor when
+context-string relocation fails."
+  (let ((ov (or (cl-find-if (lambda (o) (overlay-get o 'preview-state))
+                             (overlays-at pos))
+                (cl-find-if (lambda (o) (overlay-get o 'preview-state))
+                            (overlays-in (line-beginning-position)
+                                         (line-end-position))))))
+    (and ov (cons (overlay-start ov) (overlay-end ov)))))
+
+(defun preview--pm-place (snippet region-beg region-end box lcounters counters
+                                   tempdir open-data point-current)
+  "Place a preview overlay for SNIPPET between REGION-BEG and REGION-END.
+Helper for `preview-parse-messages'.  BOX, LCOUNTERS, COUNTERS,
+TEMPDIR, OPEN-DATA and POINT-CURRENT are as in that function.
+Returns the OVL list to append to `close-data'."
+  (let (ovl)
+    (save-excursion
+      (goto-char point-current)
+      (setq ovl (preview-place-preview
+                 snippet region-beg region-end
+                 (preview-TeX-bb box)
+                 (cons lcounters counters)
+                 tempdir (cdr open-data)))
+      (when (and (eq preview-visibility-style 'always)
+                 (<= region-beg point-current)
+                 (< point-current region-end))
+        ;; Temporarily open the preview if it would bump the point.
+        (preview-toggle (car ovl))
+        (push (car ovl) preview-temporary-opened)))
+    ovl))
+
 (defun preview-parse-messages (open-closure)
   "Turn all preview snippets into overlays.
 This parses the pseudo error messages from the preview
@@ -3634,7 +3707,7 @@ call, and in its CDR the final stuff for the placement hook."
   (with-temp-message preview-locating-previews-message
     (let (TeX-error-file TeX-error-offset snippet box counters
           file line
-          (lsnippet 0) lstart (lfile "") lline lbuffer lpoint
+          (lsnippet 0) lstart lstart-failed reloc-failed (lfile "") lline lbuffer lpoint
           lpos
           lcounters
           string after-string
@@ -3866,7 +3939,8 @@ name(\\([^)]+\\))\\)\\|\
                   (setq lfile file))
                 (save-excursion
                   (save-restriction
-                    (setq point-current (point))
+                    (setq point-current (point)
+                          reloc-failed nil)
                     (widen)
                     ;; a fast hook might have positioned us already:
                     (if (number-or-marker-p string)
@@ -3912,89 +3986,99 @@ name(\\([^)]+\\))\\)\\|\
                            (= lline line)
                            (goto-char (max (point) (- (1+ lpos) (length string)))))
 
-                      (cond
-                       ((search-forward (concat string after-string)
-                                        (line-end-position) t)
-                        (backward-char (length after-string)))
-                       ;;ok, transform ^^ sequences
-                       ((search-forward-regexp
-                         (concat "\\("
-                                 (setq string
-                                       (preview-error-quote
-                                        string))
-                                 "\\)"
-                                 (setq after-string
-                                       (preview-error-quote
-                                        after-string)))
-                         (line-end-position) t)
-                        (goto-char (match-end 1)))
-                       ((search-forward-regexp
-                         (concat "\\("
-                                 (if (string-match
-                                      "^[^\0-\177]\\{1,6\\}" string)
-                                     (setq string
-                                           (substring string (match-end 0)))
-                                   string)
-                                 "\\)"
-                                 (if (string-match
-                                      "[^\0-\177]\\{1,6\\}$" after-string)
-                                     (setq after-string
-                                           (substring after-string
-                                                      0 (match-beginning 0)))))
-                         (line-end-position) t)
-                        (goto-char (match-end 1)))
-                       (t (search-forward-regexp
-                           string
-                           (line-end-position) t))))
+                      (let ((pos-before-search (point)))
+                        (cond
+                         ((search-forward (concat string after-string)
+                                          (line-end-position) t)
+                          (backward-char (length after-string)))
+                         ;;ok, transform ^^ sequences
+                         ((search-forward-regexp
+                           (concat "\\("
+                                   (setq string
+                                         (preview-error-quote
+                                          string))
+                                   "\\)"
+                                   (setq after-string
+                                         (preview-error-quote
+                                          after-string)))
+                           (line-end-position) t)
+                          (goto-char (match-end 1)))
+                         ((search-forward-regexp
+                           (concat "\\("
+                                   (if (string-match
+                                        "^[^\0-\177]\\{1,6\\}" string)
+                                       (setq string
+                                             (substring string (match-end 0)))
+                                     string)
+                                   "\\)"
+                                   (if (string-match
+                                        "[^\0-\177]\\{1,6\\}$" after-string)
+                                       (setq after-string
+                                             (substring after-string
+                                                        0 (match-beginning 0)))))
+                           (line-end-position) t)
+                          (goto-char (match-end 1)))
+                         (t (search-forward-regexp
+                             string
+                             (line-end-position) t)))
+                        ;; If point didn't move, the compile-time context
+                        ;; no longer occurs on this line (buffer edited
+                        ;; mid-compile); a region computed from here
+                        ;; would be bogus.
+                        (setq reloc-failed (= pos-before-search (point)))))
                     (setq lline line
                           lpos (point)
                           lbuffer (current-buffer))
                     (if box
                         (progn
-                          (if (and lstart (= snippet lsnippet))
-                              (let* ((region-beg
-                                      (save-excursion
-                                        (preview-back-command
-                                         (= (prog1 (point)
-                                              (goto-char lstart))
-                                            lstart))
-                                        (point)))
-                                     (region-end
-                                      (if preview-find-end-function
-                                          (funcall preview-find-end-function
-                                                   region-beg)
-                                        (point)))
-                                     ovl)
-                                (save-excursion
-                                  ;; Restore point to current one before
-                                  ;; placing preview
-                                  (goto-char point-current)
-                                  (setq ovl (preview-place-preview
-                                             snippet
-                                             region-beg
-                                             region-end
-                                             (preview-TeX-bb box)
-                                             (cons lcounters counters)
-                                             tempdir
-                                             (cdr open-data)))
-                                  (setq close-data (nconc ovl close-data))
-                                  (when (and
-                                         (eq preview-visibility-style 'always)
-                                         (<= region-beg point-current)
-                                         (< point-current region-end))
-                                    ;; Temporarily open the preview if it
-                                    ;; would bump the point.
-                                    (preview-toggle (car ovl))
-                                    (push (car ovl) preview-temporary-opened))))
+                          (cond
+                           ((and lstart (= snippet lsnippet)
+                                 (not lstart-failed) (not reloc-failed))
+                            (let ((region-beg
+                                   (save-excursion
+                                     (preview-back-command
+                                      (= (prog1 (point)
+                                           (goto-char lstart))
+                                         lstart))
+                                     (point))))
+                              (setq close-data
+                                    (nconc (preview--pm-place
+                                            snippet region-beg
+                                            (if preview-find-end-function
+                                                (funcall
+                                                 preview-find-end-function
+                                                 region-beg)
+                                              (point))
+                                            box lcounters counters
+                                            tempdir open-data point-current)
+                                           close-data))))
+                           ((and lstart (= snippet lsnippet)
+                                 (preview--fallback-bounds (or lstart (point))))
+                            ;; Relocation failed; anchor to the existing
+                            ;; overlay's own bounds instead.
+                            (let ((bounds (preview--fallback-bounds
+                                           (or lstart (point)))))
+                              (setq close-data
+                                    (nconc (preview--pm-place
+                                            snippet (car bounds) (cdr bounds)
+                                            box lcounters counters
+                                            tempdir open-data point-current)
+                                           close-data))))
+                           ((and lstart (= snippet lsnippet))
+                            ;; No overlay to anchor to either; skip and
+                            ;; let a later, uninterrupted compile place it.
+                            nil)
+                           (t
                             (with-current-buffer run-buffer
                               (preview-log-error
                                (list 'error
                                      (format
                                       "End of Preview snippet %d unexpected"
-                                      snippet)) "Parser")))
-                          (setq lstart nil))
+                                      snippet)) "Parser"))))
+                          (setq lstart nil lstart-failed nil))
                       ;; else-part of if box
-                      (setq lstart (point) lcounters counters)
+                      (setq lstart (point) lstart-failed reloc-failed
+                            lcounters counters)
                       ;; >= because snippets in between might have
                       ;; been ignored because of TeX-default-extension
                       (unless (>= snippet (1+ lsnippet))
@@ -4605,15 +4689,35 @@ If not a regular release, the date of the last change.")
                                                  &optional enable))
 (declare-function buframe-find "ext:buframe"
                   (&optional frame-or-name buffer parent noerror))
+(declare-function buframe-update "ext:buframe" (frame-or-name))
 
 (defvar preview--buframe-error t
   "When non-nil, issue a one-time error if loading buframe fails.")
 
+(defun preview--invalidate-buframe-for (ovr)
+  "Hide the buframe popup if it is currently showing OVR's content.
+Call before OVR's backing image file(s) are removed, so a cached but
+untouched popup doesn't repaint from a now-missing file later.  Does
+nothing if a replacement overlay already covers the same text (e.g.
+OVR is being superseded during a recompile): `preview--update-buframe'
+will pick that one up on its own, without a visible hide/rebuild."
+  (when (featurep 'buframe)
+    (when-let* ((frame (buframe-find "auctex-preview" nil nil t))
+                (info (frame-parameter frame 'auctex-preview))
+                ((eq (car info) ovr))
+                ((not (cl-find-if
+                       (lambda (o) (and (not (eq o ovr))
+                                        (overlay-get o 'preview-image)))
+                       (overlays-in (overlay-start ovr) (overlay-end ovr))))))
+      (set-frame-parameter frame 'auctex-preview nil)
+      (buframe-disable frame))))
+
 (defun preview--update-buframe (&optional force)
   "Show or hide a buframe popup depending on overlays at point.
-
-The frame is not updated if the `buframe' property has not changed,
-unless FORCE is non-nil."
+Only rebuilds when the `buframe' property or `preview-image' changed,
+comparing the image by value since `preview-replace-active-icon'
+mutates it in place.  FORCE repositions and shows the frame regardless,
+but does not by itself force the more expensive rebuild."
   (let* ((frame-name "auctex-preview")
          (buf-name " *auctex-preview-buffer*")
          (old-frame (and (featurep 'buframe)
@@ -4624,53 +4728,63 @@ unless FORCE is non-nil."
                    (lambda (ov) (when (overlay-get ov 'buframe) ov))
                    (overlays-at (point))))
               (str (overlay-get ov 'buframe)))
-        (unless (and (not force)
-                     old-frame
-                     (pcase (frame-parameter old-frame 'auctex-preview)
-                       (`(,o . ,s) (and (eq o ov) (eq s str)))))
-          (if (require 'buframe nil t)
-              (let* ((buf (buframe-make-buffer
-                           buf-name
-                           (car-safe
-                            (cddr (cdr-safe
-                                   preview-at-point-placement)))))
-                     (max-image-size
-                      (if (integerp max-image-size)
-                          max-image-size
-                        ;; Set the size max-image-size using the current
-                        ;; frame, since the popup frame will be small to
-                        ;; begin with.
-                        (* max-image-size (frame-width)))))
-                (with-current-buffer buf
-                  (let (buffer-read-only)
-                    (with-silent-modifications
-                      (erase-buffer)
-                      (insert (propertize str
-                                          ;; Remove unnecessary properties
-                                          'help-echo nil
-                                          'keymap nil
-                                          'mouse-face nil))
-                      (goto-char (point-min)))))
-                (setq old-frame
-                      (buframe-make
-                       frame-name
-                       (lambda (frame)
-                         (funcall
-                          (or (car-safe (cdr-safe preview-at-point-placement))
-                              #'buframe-position-right-of-overlay)
-                          frame
-                          ov))
-                       buf
-                       (overlay-buffer ov)
-                       (window-frame)
-                       (car-safe (cdr (cdr-safe
-                                       preview-at-point-placement)))))
-                (set-frame-parameter old-frame 'auctex-preview
-                                     (cons ov str)))
-            (when preview--buframe-error
-              (setq preview--buframe-error nil)
-              (error "buframe is unavailable for use with preview. \
-See `preview-at-point-placement'."))))
+        (let* ((image (overlay-get ov 'preview-image))
+               (same (and old-frame
+                         (pcase (frame-parameter old-frame 'auctex-preview)
+                           (`(,o ,s ,img)
+                            (and (eq o ov) (eq s str) (equal img image)))))))
+          (when (or (not same) force)
+            ;; Require buframe (without autoloading it if it was never
+            ;; loaded to begin with) before calling any of its
+            ;; functions.
+            (if (not (require 'buframe nil t))
+                (when preview--buframe-error
+                  (setq preview--buframe-error nil)
+                  (error "buframe is unavailable for use with preview. \
+See `preview-at-point-placement'."))
+              (if same
+                  (buframe-update old-frame)
+                (let* ((buf (buframe-make-buffer
+                             buf-name
+                             (car-safe
+                              (cddr (cdr-safe
+                                     preview-at-point-placement)))))
+                       (max-image-size
+                        (if (integerp max-image-size)
+                            max-image-size
+                          ;; Set the size max-image-size using the current
+                          ;; frame, since the popup frame will be small to
+                          ;; begin with.
+                          (* max-image-size (frame-width)))))
+                  (with-current-buffer buf
+                    (let (buffer-read-only)
+                      (with-silent-modifications
+                        (erase-buffer)
+                        (insert (propertize str
+                                            ;; Remove unnecessary properties
+                                            'help-echo nil
+                                            'keymap nil
+                                            'mouse-face nil))
+                        (goto-char (point-min)))))
+                  (setq old-frame
+                        (buframe-make
+                         frame-name
+                         (lambda (frame)
+                           (funcall
+                            (or (car-safe (cdr-safe preview-at-point-placement))
+                                #'buframe-position-right-of-overlay)
+                            frame
+                            ov))
+                         buf
+                         (overlay-buffer ov)
+                         (window-frame)
+                         (car-safe (cdr (cdr-safe
+                                         preview-at-point-placement)))))
+                  ;; `copy-tree' the image spec: `preview-replace-active-icon'
+                  ;; mutates it in place.
+                  (set-frame-parameter
+                   old-frame 'auctex-preview
+                   (list ov str (copy-tree image))))))))
       (when old-frame
         (set-frame-parameter old-frame 'auctex-preview nil)
         (buframe-disable old-frame)))))
