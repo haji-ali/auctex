@@ -4366,9 +4366,10 @@ overview.
 @end deffn
 
 @defopt TeX-error-overview-open-after-TeX-run
-When this boolean variable is non-@code{nil}, the error overview will be
+When this variable is non-@code{nil}, the error overview will be
 automatically opened after running @TeX{} if there are errors or warnings
-to show.
+to show.  If its value is the symbol @code{errors}, the overview is
+opened only if there are errors, rather than warnings.
 @end defopt
 
 The error overview is opened in a new window of the current frame by

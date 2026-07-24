@@ -634,7 +634,9 @@ variable `TeX-parse-all-errors' is non-nil.
 
 Open the error overview if
 `TeX-error-overview-open-after-TeX-run' is non-nil and there are
-errors or warnings to show."
+errors or warnings to show.  If its value is the symbol
+`errors', only open the overview if there are errors (rather
+than warnings)."
 
   (if (TeX-ConTeXt-sentinel-check process name)
       (progn
@@ -646,15 +648,19 @@ errors or warnings to show."
         ;; variables as seen in (TeX-parse-all-errors)).  But for now, ...
         (if TeX-parse-all-errors
             (TeX-parse-all-errors))
-        (if (and (with-current-buffer TeX-command-buffer
-                   TeX-error-overview-open-after-TeX-run)
-                 (TeX-error-overview-make-entries
-                  (TeX-master-directory) (TeX-active-buffer)))
-            (TeX-error-overview)))
+        (let ((has-error (assq 'error TeX-error-list)))
+          (if (and (with-current-buffer TeX-command-buffer
+                     (and TeX-error-overview-open-after-TeX-run
+                          (or (not (eq TeX-error-overview-open-after-TeX-run
+                                       'errors))
+                              has-error)))
+                   (TeX-error-overview-make-entries
+                    (TeX-master-directory) (TeX-active-buffer)))
+              (TeX-error-overview))))
 
     (message (concat name ": formatted " (TeX-current-pages)))
     (setq TeX-command-next TeX-command-Show))
-  (unless TeX-error-list
+  (unless (TeX-error-report-has-errors-p)
     (run-hook-with-args 'TeX-after-compilation-finished-functions
                         (with-current-buffer TeX-command-buffer
                           (expand-file-name
