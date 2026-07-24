@@ -529,6 +529,23 @@ where:
                 (alist :tag "Buffer parameters")))
   :package-version '(auctex . "14.2.0"))
 
+(defvar preview-at-point-inhibit nil
+  "Inhibit display of at-point previews.
+Only consulted when `preview-visibility-style' is \\='at-point.  This
+also inhibits automatic (re)generation of previews that are being
+inhibited, since there is no point compiling something that will not
+be shown.  See `preview-at-point-inhibited-p'.
+
+Values:
+  nil       Not inhibited.
+  t         Always inhibited, in whatever scope this binding applies
+            to -- buffer-local (via `setq-local') or every buffer (via
+            `setq-default').
+  OVERLAY   Inhibited only while point remains within OVERLAY's
+            source; reset to nil automatically once point leaves it.
+            Set this way by `preview-at-point-inhibit-cycle' with no
+            prefix argument.")
+
 (defun preview-string-expand (arg &optional separator)
   "Expand ARG as a string.
 It can already be a string.  Or it can be a list, then it is
@@ -2418,6 +2435,9 @@ overlays not in the active window."
                                   (overlay-end (car lst)))))
                     (cdr lst))))
           (goto-char pt)))))
+  (when (and (overlayp preview-at-point-inhibit)
+             (not (memq preview-at-point-inhibit (overlays-at (point)))))
+    (setq-local preview-at-point-inhibit nil))
   (preview--update-buframe))
 
 (defun preview-open-overlays (list &optional pos)
@@ -3199,6 +3219,7 @@ See description of `TeX-command-list' for details."
     (define-key map "\C-c\C-s" #'preview-clearout-section)
     (define-key map "\C-c\C-b" #'preview-clearout-buffer)
     (define-key map "\C-c\C-d" #'preview-clearout-document)
+    (define-key map "\C-k" #'preview-at-point-inhibit-cycle)
     map))
 
 (defun preview-copy-text (ov)
@@ -4778,7 +4799,8 @@ but does not by itself force the more expensive rebuild."
                          ;; Do not autoload buframe if it is not already
                          ;; loaded.
                          (buframe-find frame-name nil nil t))))
-    (if-let* ((ov (cl-find-if
+    (if-let* (((not (preview-at-point-inhibited-p (point))))
+              (ov (cl-find-if
                    (lambda (ov) (when (overlay-get ov 'buframe) ov))
                    (overlays-at (point))))
               (str (overlay-get ov 'buframe)))
@@ -4842,6 +4864,65 @@ See `preview-at-point-placement'."))
       (when old-frame
         (set-frame-parameter old-frame 'auctex-preview nil)
         (buframe-disable old-frame)))))
+
+;;; preview-at-point-inhibit -- Temporarily hide at-point previews
+
+(defun preview-at-point-inhibited-p (&optional pt)
+  "Non-nil if the at-point preview at PT (default point) should stay hidden."
+  (and (eq preview-visibility-style 'at-point)
+       (or (eq preview-at-point-inhibit t)
+           (and (overlayp preview-at-point-inhibit)
+                (memq preview-at-point-inhibit (overlays-at (or pt (point))))))))
+
+(defun preview--quiet-overlays (beg end)
+  "Hide previews in BEG..END without discarding their cached images."
+  (dolist (ov (overlays-in beg end))
+    (pcase (overlay-get ov 'preview-state)
+      ;; `preview-toggle' also handles urgentization and buframe
+      ;; bookkeeping, so prefer it when it will cooperate.
+      ('inactive (preview-toggle ov t))
+      ;; `preview-toggle' refuses to touch `disabled' overlays, so
+      ;; clear the display properties it would otherwise clear.
+      ('disabled (let ((prop (if (consp preview-at-point-placement)
+                                 (car preview-at-point-placement)
+                               preview-at-point-placement)))
+                   (dolist (p (list prop 'display 'keymap 'mouse-face
+                                    'help-echo))
+                     (overlay-put ov p nil)))))))
+
+;;;###autoload
+(defun preview-at-point-inhibit-cycle (&optional arg)
+  "Toggle inhibiting display of at-point previews.
+With no prefix ARG, toggle for the preview overlay under point (reset
+automatically once point leaves it).  With one \\[universal-argument],
+toggle for the current buffer.  With two, toggle in every buffer."
+  (interactive "P")
+  (unless (eq preview-visibility-style 'at-point)
+    (user-error "`preview-visibility-style' is not `at-point'"))
+  (pcase (and arg (prefix-numeric-value arg))
+    ('nil
+     (let ((ov (cl-find-if (lambda (o) (overlay-get o 'preview-state))
+                           (overlays-at (point)))))
+       (setq-local preview-at-point-inhibit
+                   (if (and ov (eq preview-at-point-inhibit ov)) nil ov)))
+     (when (overlayp preview-at-point-inhibit)
+       (preview--quiet-overlays (overlay-start preview-at-point-inhibit)
+                                (overlay-end preview-at-point-inhibit))))
+    (4
+     (setq-local preview-at-point-inhibit
+                 (if (eq preview-at-point-inhibit t) nil t))
+     (when preview-at-point-inhibit
+       (preview--quiet-overlays (point-min) (point-max))))
+    (_
+     (setq-default preview-at-point-inhibit
+                   (if (eq (default-value 'preview-at-point-inhibit) t)
+                       nil t))
+     (when (default-value 'preview-at-point-inhibit)
+       (dolist (buf (buffer-list))
+         (with-current-buffer buf
+           (when (bound-and-true-p preview-automatic-mode)
+             (preview--quiet-overlays (point-min) (point-max))))))))
+  (preview--update-buframe))
 
 ;;; preview-automatic -- Auto-preview
 
@@ -4954,15 +5035,18 @@ Tags it to resume at PT once it is gone."
                                       (eq (overlay-get ov 'category)
                                           'preview-overlay))
                                     (overlays-at (point))))
-                              (region (or
-                                       (and cur
-                                            (eq
-                                             (overlay-get cur 'preview-state)
-                                             'disabled))
-                                       (and (not cur)
-                                            preview-automatic-function
-                                            (funcall
-                                             preview-automatic-function)))))
+                              (region (and
+                                       (not (preview-at-point-inhibited-p
+                                             (point)))
+                                       (or
+                                        (and cur
+                                             (eq
+                                              (overlay-get cur 'preview-state)
+                                              'disabled))
+                                        (and (not cur)
+                                             preview-automatic-function
+                                             (funcall
+                                              preview-automatic-function))))))
                          (when region
                            (if (consp region)
                                region
