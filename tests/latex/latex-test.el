@@ -1,6 +1,6 @@
 ;;; latex-test.el --- tests for LaTeX mode  -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2014-2025  Free Software Foundation, Inc.
+;; Copyright (C) 2014-2026  Free Software Foundation, Inc.
 
 ;; This file is part of AUCTeX.
 
@@ -773,5 +773,50 @@ check the indentation for optional argument of \\usepackage."
       (LaTeX-mode)
       (should (equal (point-max)
                      (TeX-find-macro-end-helper (point-min)))))))
+
+(ert-deftest LaTeX-parse-key-val-label ()
+  "Test for parsing labels with \\label and as key-val."
+  (with-temp-buffer
+    (insert "\
+\\documentclass{article}
+
+\\usepackage{%
+  listings ,
+  fancyvrb
+}
+
+\\begin{document}
+
+\\section{Test}
+\\label{sec:test}
+
+\\begin{equation}
+  \\label{eq:1}
+  a + b = c
+\\end{equation}
+
+\\begin{lstlisting}[
+  caption = This is a caption ,
+  label   = {lst:1}
+]
+This is a listing.
+\\end{lstlisting}
+
+\\begin{Verbatim}[reflabel={lst:2}]
+This is verbatim
+\\end{Verbatim}
+
+\\lstinputlisting[
+  caption = Some caption ,
+  label   = lst:3 % Not recommended; write {lst:3}
+]{file}
+
+\\end{document}")
+    (LaTeX-mode)
+    (let ((TeX-parse-self t))
+      (TeX-update-style t))
+    (should (equal
+             (sort (mapcar #'car (LaTeX-label-list)))
+             (sort '("sec:test" "eq:1" "lst:1" "lst:2" "lst:3"))))))
 
 ;;; latex-test.el ends here
