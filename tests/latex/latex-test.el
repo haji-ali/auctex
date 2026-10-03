@@ -764,10 +764,10 @@ check the indentation for optional argument of \\usepackage."
 (ert-deftest TeX-find-macro-end-with-complicated-optional-args ()
   "Check that end of macro is determined correctly."
   ;; (bug#78587)
-  (dolist (str '("\begin{enumerate}[a]"
-                 "\begin{enumerate}[(a)]"
-                 "\begin{enumerate}[a)]"
-                 "\begin{enumerate}[a{]}]"))
+  (dolist (str '("\\begin{enumerate}[a]"
+                 "\\begin{enumerate}[(a)]"
+                 "\\begin{enumerate}[a)]"
+                 "\\begin{enumerate}[a{]}]"))
     (with-temp-buffer
       (insert str)
       (LaTeX-mode)
