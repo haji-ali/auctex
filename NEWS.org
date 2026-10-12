@@ -7,6 +7,20 @@
 # License: GNU General Public License 3
 # The format is based on [[https://keepachangelog.com/en/1.1.0/][Keep a Changelog]]
 
+* [Unreleased]
+
+** Added
+
+- Add support for conditionally opening error overview when there are
+  errors.  See ~TeX-error-overview-open-after-TeX-run~.
+- Add support for sorting the error overview by the File or Type
+  column.  Use =S= (or click a column header) to sort, with a prefix
+  argument of -1 to restore the original order.
+
+** Changed
+
+- Slight change to LaTeX compilation message.
+
 * [14.2.0] - 2026-09-15
 
 ** Added

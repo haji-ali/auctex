@@ -8590,27 +8590,76 @@ variable `TeX-parse-all-errors' is non-nil.
 
 Open the error overview if
 `TeX-error-overview-open-after-TeX-run' is non-nil and there are
-errors or warnings to show."
-  (if (TeX-TeX-sentinel-check process name)
-      (progn
-        (if TeX-parse-all-errors
-            (TeX-parse-all-errors))
-        (if (and (with-current-buffer TeX-command-buffer
-                   TeX-error-overview-open-after-TeX-run)
-                 (TeX-error-overview-make-entries
-                  (TeX-master-directory) (TeX-active-buffer)))
-            (TeX-error-overview)))
-    (message (concat name ": formatted " (TeX-current-pages)))
-    (let (dvi2pdf)
-      (if (with-current-buffer TeX-command-buffer
-            (and TeX-PDF-mode (setq dvi2pdf (TeX-PDF-from-DVI))))
-          (setq TeX-command-next dvi2pdf)
-        (setq TeX-command-next TeX-command-Show))))
-  (unless TeX-error-list
-    (run-hook-with-args 'TeX-after-compilation-finished-functions
-                        (with-current-buffer TeX-command-buffer
-                          (expand-file-name
-                           (TeX-active-master (TeX-output-extension)))))))
+errors or warnings to show.  If its value is the symbol
+`errors', only open the overview if there are errors (rather
+than warnings)."
+  (when TeX-parse-all-errors
+    (TeX-parse-all-errors))
+
+  (let ((counts (TeX--error-list-counts)))
+    (when (and (with-current-buffer TeX-command-buffer
+                 (and TeX-error-overview-open-after-TeX-run
+                      (or (not (eq TeX-error-overview-open-after-TeX-run
+                                   'errors))
+                          (gethash 'error counts))))
+               (TeX-error-overview-make-entries
+                (TeX-master-directory) (TeX-active-buffer)))
+      (TeX-error-overview))
+
+    (unless (TeX-TeX-sentinel-check process name)
+      (message "%s: formatted %s%s" name (TeX-current-pages)
+               (TeX--error-list-summary counts))
+      (let (dvi2pdf)
+        (if (with-current-buffer TeX-command-buffer
+              (and TeX-PDF-mode (setq dvi2pdf (TeX-PDF-from-DVI))))
+            (setq TeX-command-next dvi2pdf)
+          (setq TeX-command-next TeX-command-Show))))
+
+    (unless (TeX-error-report-has-errors-p)
+      (run-hook-with-args 'TeX-after-compilation-finished-functions
+                          (with-current-buffer TeX-command-buffer
+                            (expand-file-name
+                             (TeX-active-master (TeX-output-extension))))))))
+
+(defun TeX--error-list-counts ()
+  "Return a hash table mapping each type in `TeX-error-list' to its count.
+Entries skipped by `TeX-error-list-skip-warning-p' are not counted."
+  (let ((counts (make-hash-table)))
+    (dolist (entry TeX-error-list counts)
+      (let ((type (nth 0 entry)))
+        (unless (TeX-error-list-skip-warning-p type (nth 10 entry))
+          (puthash type (1+ (gethash type counts 0)) counts))))))
+
+(defun TeX--error-list-summary (counts)
+  "Return a \" (with ...)\" note on warnings and bad boxes, or \"\".
+COUNTS is a hash table as returned by `TeX--error-list-counts'.  When
+`TeX-parse-all-errors' is nil, `TeX-error-list' is not filled in, so
+the output buffer is searched instead and no counts are given."
+  (let* ((describe
+          (lambda (n singular plural)
+            (propertize (cond ((not (numberp n)) plural)
+                              ((= n 1) (concat "1 " singular))
+                              (t (format "%d %s" n plural)))
+                        'face 'TeX-error-description-warning)))
+         (warnings (if TeX-parse-all-errors
+                       (gethash 'warning counts)
+                     (and TeX-debug-warnings
+                          (TeX-LaTeX-sentinel-has-warnings)
+                          t)))
+         (bad-boxes (if TeX-parse-all-errors
+                        (gethash 'bad-box counts)
+                      (and TeX-debug-bad-boxes
+                           (TeX-LaTeX-sentinel-has-bad-boxes)
+                           t))))
+    (if (or warnings bad-boxes)
+        (concat " (with "
+                (when warnings
+                  (funcall describe warnings "warning" "warnings"))
+                (when (and warnings bad-boxes) " and ")
+                (when bad-boxes
+                  (funcall describe bad-boxes "bad box" "bad boxes"))
+                ")")
+      "")))
 
 (defun TeX-current-pages ()
   "Return string indicating the number of pages formatted."
@@ -8721,157 +8770,149 @@ variable `TeX-parse-all-errors' is non-nil.
 
 Open the error overview if
 `TeX-error-overview-open-after-TeX-run' is non-nil and there are
-errors or warnings to show."
+errors or warnings to show.  If its value is the symbol
+`errors', only open the overview if there are errors (rather
+than warnings)."
   (if TeX-parse-all-errors
       (TeX-parse-all-errors))
-  (if (and (with-current-buffer TeX-command-buffer
-             TeX-error-overview-open-after-TeX-run)
-           (TeX-error-overview-make-entries
-            (TeX-master-directory) (TeX-active-buffer)))
+
+  (let ((counts (TeX--error-list-counts))
+        rerun-msg)
+    (when (and (with-current-buffer TeX-command-buffer
+                 (and TeX-error-overview-open-after-TeX-run
+                      (or (not (eq TeX-error-overview-open-after-TeX-run
+                                   'errors))
+                          (gethash 'error counts))))
+               (TeX-error-overview-make-entries
+                (TeX-master-directory) (TeX-active-buffer)))
       (TeX-error-overview))
-  (cond ((TeX-TeX-sentinel-check process name))
-        ((and (save-excursion
-                (re-search-forward
-                 "^Package biblatex Warning: Please (re)run Biber on the file"
-                 nil t))
+
+    (unless (TeX-TeX-sentinel-check process name)
+      ;; Chosen below from the rerun checks and the banner.
+      (setq TeX-command-next nil)
+      (cond
+       ((and (save-excursion
+               (re-search-forward
+                "^Package biblatex Warning: Please (re)run Biber on the file"
+                nil t))
+             (with-current-buffer TeX-command-buffer
+               (and (LaTeX-bibliography-list)
+                    (TeX-check-files (TeX-master-file "bbl")
+                                     (TeX-style-list)
+                                     (append TeX-file-extensions
+                                             BibTeX-file-extensions
+                                             TeX-Biber-file-extensions)))))
+        (setq rerun-msg "run Biber")
+        (setq TeX-command-next
               (with-current-buffer TeX-command-buffer
-                (and (LaTeX-bibliography-list)
-                     (TeX-check-files (TeX-master-file "bbl")
-                                      (TeX-style-list)
-                                      (append TeX-file-extensions
-                                              BibTeX-file-extensions
-                                              TeX-Biber-file-extensions)))))
-         (message "%s%s" "You should run Biber to get citations right, "
-                  (TeX-current-pages))
-         (setq TeX-command-next (with-current-buffer TeX-command-buffer
-                                  TeX-command-Biber)))
-        ((and (save-excursion
-                (re-search-forward
-                 "^\\(?:LaTeX\\|Package natbib\\) Warning: Citation" nil t))
-              (with-current-buffer TeX-command-buffer
-                (and (LaTeX-bibliography-list)
-                     (TeX-check-files (TeX-master-file "bbl")
-                                      (TeX-style-list)
-                                      (append TeX-file-extensions
-                                              BibTeX-file-extensions
-                                              TeX-Biber-file-extensions)))))
-         (message "%s%s" "You should run BibTeX to get citations right, "
-                  (TeX-current-pages))
-         (setq TeX-command-next (with-current-buffer TeX-command-buffer
-                                  TeX-command-BibTeX)))
-        ((re-search-forward "Package biblatex Warning: Please rerun LaTeX" nil t)
-         (message "%s%s" "You should run LaTeX again, " (TeX-current-pages))
-         (setq TeX-command-next TeX-command-default))
-        ((re-search-forward "^(biblatex)\\W+Page breaks have changed" nil t)
-         (message "%s%s" "You should run LaTeX again - page breaks have changed, "
-                  (TeX-current-pages))
-         (setq TeX-command-next TeX-command-default))
-        ((re-search-forward "^\\(?:LaTeX Warning: Label(s)\\|\
+                TeX-command-Biber)))
+       ((and (save-excursion
+               (re-search-forward
+                "^\\(?:LaTeX\\|Package natbib\\) Warning: Citation" nil t))
+             (with-current-buffer TeX-command-buffer
+               (and (LaTeX-bibliography-list)
+                    (TeX-check-files (TeX-master-file "bbl")
+                                     (TeX-style-list)
+                                     (append TeX-file-extensions
+                                             BibTeX-file-extensions
+                                             TeX-Biber-file-extensions)))))
+        (setq rerun-msg "run BibTeX")
+        (setq TeX-command-next (with-current-buffer TeX-command-buffer
+                                 TeX-command-BibTeX)))
+       ((re-search-forward "Package biblatex Warning: Please rerun LaTeX" nil t)
+        (setq rerun-msg "run LaTeX")
+        (setq TeX-command-next TeX-command-default))
+       ((re-search-forward "^(biblatex)\\W+Page breaks have changed" nil t)
+        (setq rerun-msg "rerun LaTeX for page breaks")
+        (setq TeX-command-next TeX-command-default))
+       ((re-search-forward "^\\(?:LaTeX Warning: Label(s)\\|\
 Package natbib Warning: Citation(s)\\)" nil t)
-         (message "%s%s" "You should run LaTeX again to get references right, "
-                  (TeX-current-pages))
-         (setq TeX-command-next TeX-command-default))
-        ((re-search-forward
-          "^\\(?:(rerunfilecheck)\\|Package hyperref Warning:\\)\\W+\
+        (setq rerun-msg "rerun LaTeX for references")
+        (setq TeX-command-next TeX-command-default))
+       ((re-search-forward
+         "^\\(?:(rerunfilecheck)\\|Package hyperref Warning:\\)\\W+\
 Rerun to get outlines right" nil t)
-         (message "%s%s" "You should run LaTeX again to get outlines right, "
-                  (TeX-current-pages))
-         (setq TeX-command-next TeX-command-default))
-        ((re-search-forward "^LaTeX Warning: Reference" nil t)
-         (message "%s%s%s" name ": there were unresolved references, "
-                  (TeX-current-pages))
-         (let (dvi2pdf)
-           (if (with-current-buffer TeX-command-buffer
-                 (and TeX-PDF-mode (setq dvi2pdf (TeX-PDF-from-DVI))))
-               (setq TeX-command-next dvi2pdf)
-             (setq TeX-command-next TeX-command-Show))))
-        ((re-search-forward "^\\(?:LaTeX Warning: Citation\\|\
+        (setq rerun-msg "rerun LaTeX for outlines")
+        (setq TeX-command-next TeX-command-default))
+       ((re-search-forward "^LaTeX Warning: Reference" nil t)
+        (setq rerun-msg "unresolved references"))
+       ((re-search-forward "^\\(?:LaTeX Warning: Citation\\|\
 Package natbib Warning:.*undefined citations\\)" nil t)
-         (message "%s%s%s" name ": there were unresolved citations, "
-                  (TeX-current-pages))
-         (let (dvi2pdf)
-           (if (with-current-buffer TeX-command-buffer
-                 (and TeX-PDF-mode (setq dvi2pdf (TeX-PDF-from-DVI))))
-               (setq TeX-command-next dvi2pdf)
-             (setq TeX-command-next TeX-command-Show))))
-        ((re-search-forward "^No file .*\\.\\(toc\\|lof\\|lot\\)\\.$" nil t)
-         (message "%s" (concat "You should run LaTeX again to get "
-                               (upcase (match-string-no-properties 1))
-                               " right"))
-         (setq TeX-command-next TeX-command-default))
-        ((re-search-forward "Package longtable Warning: Table widths have \
+        (setq rerun-msg "unresolved citations"))
+       ((re-search-forward "^No file .*\\.\\(toc\\|lof\\|lot\\)\\.$" nil t)
+        (setq rerun-msg (concat "run LaTeX for "
+                                (upcase (match-string-no-properties 1))))
+        (setq TeX-command-next TeX-command-default))
+       ((re-search-forward "Package longtable Warning: Table widths have \
 changed\\. Rerun LaTeX\\." nil t)
-         (message
-          "%s" "You should run LaTeX again to get table formatting right")
-         (setq TeX-command-next TeX-command-default))
-        ((re-search-forward "^hf-TikZ Warning: Mark '.*' changed\\. \
+        (setq rerun-msg "rerun LaTeX for table formatting")
+        (setq TeX-command-next TeX-command-default))
+       ((re-search-forward "^hf-TikZ Warning: Mark '.*' changed\\. \
 Rerun to get mark in right position\\." nil t)
-         (message
-          "%s" "You should run LaTeX again to get TikZ marks in right position")
-         (setq TeX-command-next TeX-command-default))
-        ((re-search-forward "^Package Changebar Warning: \
+        (setq rerun-msg "rerun LaTeX for TikZ marks")
+        (setq TeX-command-next TeX-command-default))
+       ((re-search-forward "^Package Changebar Warning: \
 Changebar info has changed." nil t)
-         (message
-          "%s" "You should run LaTeX again to get the change bars right")
-         (setq TeX-command-next TeX-command-default))
-        ((re-search-forward "^LaTeX Warning: Endnotes may have changed. \
+        (setq rerun-msg "rerun LaTeX for change bars")
+        (setq TeX-command-next TeX-command-default))
+       ((re-search-forward "^LaTeX Warning: Endnotes may have changed. \
 Rerun to get them right" nil t)
-         (message
-          "%s" "You should run LaTeX again to get the endnotes right")
-         (setq TeX-command-next TeX-command-default))
-        ((re-search-forward "^\\* xsim warning: \"rerun\"" nil t)
-         (message
-          "%s" "You should run LaTeX again to synchronize exercise properties")
-         (setq TeX-command-next TeX-command-default))
-        ((re-search-forward
-          TeX-LaTeX-sentinel-banner-regexp nil t)
-         (let* ((warnings (and TeX-debug-warnings
-                               (TeX-LaTeX-sentinel-has-warnings)))
-                (bad-boxes (and TeX-debug-bad-boxes
-                                (TeX-LaTeX-sentinel-has-bad-boxes)))
-                (add-info (when (or warnings bad-boxes)
-                            (concat " (with "
-                                    (when warnings "warnings")
-                                    (when (and warnings bad-boxes) " and ")
-                                    (when bad-boxes "bad boxes")
-                                    ")"))))
-           (message "%s" (concat name ": successfully formatted "
-                                 (TeX-current-pages) add-info)))
-         (let (dvi2pdf)
-           (if (with-current-buffer TeX-command-buffer
-                 (and TeX-PDF-mode (setq dvi2pdf (TeX-PDF-from-DVI))))
-               (setq TeX-command-next dvi2pdf)
-             (setq TeX-command-next TeX-command-Show))))
-        (t
-         (message "%s%s%s" name ": problems after " (TeX-current-pages))
-         (setq TeX-command-next TeX-command-default)))
+        (setq rerun-msg "rerun LaTeX for endnotes")
+        (setq TeX-command-next TeX-command-default))
+       ((re-search-forward "^\\* xsim warning: \"rerun\"" nil t)
+        (setq rerun-msg "rerun LaTeX for exercise properties")
+        (setq TeX-command-next TeX-command-default)))
 
-  ;; Check whether the idx file changed.
-  (let (idx-file)
-    (and (file-exists-p
-          (setq idx-file
-                (with-current-buffer TeX-command-buffer
-                  (expand-file-name (TeX-active-master "idx")))))
-         ;; imakeidx package automatically runs makeindex, thus, we need to be
-         ;; sure .ind file isn't newer than .idx.
-         (TeX-check-files (with-current-buffer TeX-command-buffer
-                            (expand-file-name (TeX-active-master "ind")))
+      ;; The searches above may have moved point past the banner.
+      (let ((formatted (save-excursion
+                         (goto-char (point-min))
+                         (re-search-forward TeX-LaTeX-sentinel-banner-regexp
+                                            nil t))))
+        (message "%s: %s %s%s%s"
+                 name
+                 (if formatted
+                     "successfully formatted"
+                   "faced problems formatting")
+                 (TeX-current-pages)
+                 (TeX--error-list-summary counts)
+                 (if rerun-msg
+                     (concat " -- " rerun-msg)
+                   ""))
+        (unless TeX-command-next
+          (if formatted
+              (let (dvi2pdf)
+                (if (with-current-buffer TeX-command-buffer
+                      (and TeX-PDF-mode (setq dvi2pdf (TeX-PDF-from-DVI))))
+                    (setq TeX-command-next dvi2pdf)
+                  (setq TeX-command-next TeX-command-Show)))
+            (setq TeX-command-next TeX-command-default)))))
+
+    ;; Check whether the idx file changed.
+    (let (idx-file)
+      (and (file-exists-p
+            (setq idx-file
+                  (with-current-buffer TeX-command-buffer
+                    (expand-file-name (TeX-active-master "idx")))))
+           ;; imakeidx package automatically runs makeindex, thus, we need to be
+           ;; sure .ind file isn't newer than .idx.
+           (TeX-check-files (with-current-buffer TeX-command-buffer
+                              (expand-file-name (TeX-active-master "ind")))
+                            (with-current-buffer TeX-command-buffer
+                              (list (file-name-nondirectory (TeX-active-master))))
+                            '("idx"))
+           (with-temp-buffer
+             (insert-file-contents-literally idx-file)
+             (not (equal
+                   ;; Compare old md5 hash of the idx file with the new one.
+                   (cdr (assoc idx-file LaTeX-idx-md5-alist))
+                   (md5 (current-buffer)))))
+           (push (cons idx-file t) LaTeX-idx-changed-alist)))
+
+    (unless (TeX-error-report-has-errors-p)
+      (run-hook-with-args 'TeX-after-compilation-finished-functions
                           (with-current-buffer TeX-command-buffer
-                            (list (file-name-nondirectory (TeX-active-master))))
-                          '("idx"))
-         (with-temp-buffer
-           (insert-file-contents-literally idx-file)
-           (not (equal
-                 ;; Compare old md5 hash of the idx file with the new one.
-                 (cdr (assoc idx-file LaTeX-idx-md5-alist))
-                 (md5 (current-buffer)))))
-         (push (cons idx-file t) LaTeX-idx-changed-alist)))
-
-  (unless (TeX-error-report-has-errors-p)
-    (run-hook-with-args 'TeX-after-compilation-finished-functions
-                        (with-current-buffer TeX-command-buffer
-                          (expand-file-name
-                           (TeX-active-master (TeX-output-extension)))))))
+                            (expand-file-name
+                             (TeX-active-master (TeX-output-extension))))))))
 
 ;; should go into latex.el? --pg
 (defun TeX-BibTeX-sentinel (_process _name)
@@ -10588,13 +10629,40 @@ forward, if negative)."
 (defvar TeX-error-overview-list-entries nil
   "List of errors to be used in the error overview.")
 
+(defun TeX-error-overview--info (entry)
+  "Return the raw `TeX-error-list' entry for tabulated-list ENTRY.
+ENTRY's ID is the entry's index into `TeX-error-list', as set up by
+`TeX-error-overview-make-entries'."
+  (with-current-buffer TeX-error-overview-active-buffer
+    (nth (car entry) TeX-error-list)))
+
+(defun TeX-error-overview-type-lessp (entry1 entry2)
+  "Sort predicate for the Type column of `TeX-error-overview-mode'.
+Errors rank before warnings, which rank before bad boxes.
+Return non-nil if ENTRY1 should sort before ENTRY2."
+  (let ((rank '((error . 0) (warning . 1) (bad-box . 2))))
+    (< (or (cdr (assq (nth 0 (TeX-error-overview--info entry1)) rank)) 3)
+       (or (cdr (assq (nth 0 (TeX-error-overview--info entry2)) rank)) 3))))
+
+(defun TeX-error-overview-file-lessp (entry1 entry2)
+  "Sort predicate for the File column of `TeX-error-overview-mode'.
+Sort by file name, breaking ties by line number.
+Return non-nil if ENTRY1 should sort before ENTRY2."
+  (let* ((info1 (TeX-error-overview--info entry1))
+         (info2 (TeX-error-overview--info entry2))
+         (file1 (or (nth 1 info1) ""))
+         (file2 (or (nth 1 info2) "")))
+    (if (string= file1 file2)
+        (< (or (nth 2 info1) 0) (or (nth 2 info2) 0))
+      (string< file1 file2))))
+
 (define-derived-mode TeX-error-overview-mode tabulated-list-mode
                      "TeX errors"
   "Major mode for listing TeX errors."
   :syntax-table nil :abbrev-table nil :interactive nil
-  (setq tabulated-list-format [("File" 25 nil)
+  (setq tabulated-list-format [("File" 25 TeX-error-overview-file-lessp)
                                ("Line" 4 nil :right-align t)
-                               ("Type" 7 nil)
+                               ("Type" 7 TeX-error-overview-type-lessp)
                                ("Message" 0 nil)]
         tabulated-list-padding 1
         tabulated-list-entries TeX-error-overview-list-entries)
@@ -10621,9 +10689,14 @@ forward, if negative)."
              (tool-bar-lines integer)))
 
 (defcustom TeX-error-overview-open-after-TeX-run nil
-  "Whether to open automatically the error overview after running TeX."
+  "Whether to open automatically the error overview after running TeX.
+If nil, never open it.  If t, open it when there are errors or
+warnings.  If it is the symbol `errors', only open it when there
+are errors."
   :group 'TeX-output
-  :type 'boolean)
+  :type '(radio (const :tag "Don't open error/warning overview" nil)
+                (const :tag "Open error/warning overview" t)
+                (const :tag "Open overview only with errors" errors)))
 
 (defun TeX-error-overview ()
   "Show an overview of the errors occurred in the last TeX run."
@@ -10652,12 +10725,15 @@ forward, if negative)."
                   (get-buffer-create TeX-error-overview-buffer-name)
                 (TeX-error-overview-mode)))
             ;; Move point to the line associated to the last visited
-            ;; error.
+            ;; error.  Rows are found by ID rather than by line number,
+            ;; since skipped warnings and sorting shift the rows.
             (with-current-buffer TeX-error-overview-buffer-name
-              (goto-char (point-min))
-              (forward-line (with-current-buffer
-                                TeX-error-overview-active-buffer
-                              TeX-error-last-visited))
+              (goto-char (or (text-property-any
+                              (point-min) (point-max) 'tabulated-list-id
+                              (with-current-buffer
+                                  TeX-error-overview-active-buffer
+                                TeX-error-last-visited))
+                             (point-min)))
               ;; Create a new frame for the error overview or display the
               ;; buffer in the same frame, depending on the setup.
               (if (TeX-error-overview-setup)
